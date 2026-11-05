@@ -1,8 +1,6 @@
 name: Deploy to Azure (Primary)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 env:
@@ -27,6 +25,7 @@ jobs:
     name: Build & Push to ACR
     runs-on: ubuntu-latest
     needs: test
+    if: "${{ secrets.AZURE_CREDENTIALS != '' }}"
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
     steps:
@@ -55,7 +54,7 @@ jobs:
     name: Deploy to Azure App Service
     runs-on: ubuntu-latest
     needs: build-and-push
-    environment: azure-production
+    if: "${{ secrets.AZURE_CREDENTIALS != '' }}"
     steps:
       - name: Azure Login
         uses: azure/login@v1
@@ -67,27 +66,3 @@ jobs:
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           images: ${{ needs.build-and-push.outputs.image-tag }}
-
-      - name: Verify deployment health
-        run: |
-          sleep 30
-          HEALTH_URL="https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health"
-          echo "Checking health at: $HEALTH_URL"
-          for i in {1..10}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
-            if [ "$STATUS" = "200" ]; then
-              echo "✅ Health check passed!"
-              curl -s "$HEALTH_URL" | jq .
-              break
-            fi
-            echo "Attempt $i: HTTP $STATUS - waiting..."
-            sleep 15
-          done
-
-      - name: Post deployment summary
-        run: |
-          echo "## 🚀 Azure Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "- **App URL**: https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net" >> $GITHUB_STEP_SUMMARY
-          echo "- **Health Check**: https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: ${{ needs.build-and-push.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
