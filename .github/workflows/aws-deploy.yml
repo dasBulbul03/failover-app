@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ap-southeast-2
   ECR_REPOSITORY: failover-app
   IMAGE_NAME: failover-app
 
@@ -43,13 +43,16 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build, tag, and push image to ECR
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker build --platform linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
@@ -58,7 +61,6 @@ jobs:
     name: Deploy to AWS App Runner
     runs-on: ubuntu-latest
     needs: build-and-push-ecr
-    environment: aws-secondary
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -78,11 +80,11 @@ jobs:
           port: 3000
           cpu: 1
           memory: 2
-          wait-for-service-stability-seconds: 300
+          wait-for-service-stability-seconds: 600
 
       - name: Verify deployment health
         run: |
-          sleep 30
+          sleep 15
           HEALTH_URL="${{ steps.deploy.outputs.service-url }}/api/health"
           echo "Checking health at: $HEALTH_URL"
           for i in {1..10}; do
