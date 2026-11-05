@@ -1,0 +1,93 @@
+name: Deploy to Azure (Primary)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AZURE_WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_NAME: failover-app
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint --if-present
+
+  build-and-push:
+    name: Build & Push to ACR
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          echo "tags=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "latest=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.tags }} -t ${{ steps.meta.outputs.latest }} .
+          docker push ${{ steps.meta.outputs.tags }}
+          docker push ${{ steps.meta.outputs.latest }}
+
+  deploy:
+    name: Deploy to Azure App Service
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: azure-production
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          images: ${{ needs.build-and-push.outputs.image-tag }}
+
+      - name: Verify deployment health
+        run: |
+          sleep 30
+          HEALTH_URL="https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health"
+          echo "Checking health at: $HEALTH_URL"
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Health check passed!"
+              curl -s "$HEALTH_URL" | jq .
+              break
+            fi
+            echo "Attempt $i: HTTP $STATUS - waiting..."
+            sleep 15
+          done
+
+      - name: Post deployment summary
+        run: |
+          echo "## 🚀 Azure Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **App URL**: https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Check**: https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ needs.build-and-push.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

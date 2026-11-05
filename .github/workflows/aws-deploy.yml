@@ -1,0 +1,104 @@
+name: Deploy to AWS (Secondary)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: failover-app
+  IMAGE_NAME: failover-app
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint --if-present
+
+  build-and-push-ecr:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  deploy-apprunner:
+    name: Deploy to AWS App Runner
+    runs-on: ubuntu-latest
+    needs: build-and-push-ecr
+    environment: aws-secondary
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to App Runner
+        id: deploy
+        uses: awslabs/amazon-app-runner-deploy@main
+        with:
+          service: ${{ env.IMAGE_NAME }}
+          image: ${{ needs.build-and-push-ecr.outputs.image-uri }}
+          access-role-arn: ${{ secrets.APP_RUNNER_ROLE_ARN }}
+          region: ${{ env.AWS_REGION }}
+          port: 3000
+          cpu: 1
+          memory: 2
+          wait-for-service-stability-seconds: 300
+
+      - name: Verify deployment health
+        run: |
+          sleep 30
+          HEALTH_URL="${{ steps.deploy.outputs.service-url }}/api/health"
+          echo "Checking health at: $HEALTH_URL"
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Health check passed!"
+              curl -s "$HEALTH_URL" | jq .
+              break
+            fi
+            echo "Attempt $i: HTTP $STATUS - waiting..."
+            sleep 15
+          done
+
+      - name: Post deployment summary
+        run: |
+          echo "## 🚀 AWS Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **App URL**: ${{ steps.deploy.outputs.service-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Check**: ${{ steps.deploy.outputs.service-url }}/api/health" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ needs.build-and-push-ecr.outputs.image-uri }}" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,70 @@
+name: Manual Failover Trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Failover action'
+        required: true
+        type: choice
+        options:
+          - failover-to-aws
+          - failback-to-azure
+      reason:
+        description: 'Reason for failover'
+        required: false
+        default: 'Manual failover triggered'
+
+jobs:
+  failover:
+    name: Execute Failover
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Failover to AWS (disable Azure Traffic Manager Azure endpoint)
+        if: github.event.inputs.action == 'failover-to-aws'
+        run: |
+          echo "🔄 Initiating failover to AWS..."
+          echo "Reason: ${{ github.event.inputs.reason }}"
+
+          # Disable Azure endpoint in Traffic Manager (forces traffic to AWS)
+          az network traffic-manager endpoint update \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --profile-name ${{ secrets.TM_PROFILE_NAME }} \
+            --name azure-primary \
+            --type azureEndpoints \
+            --endpoint-status Disabled
+
+          echo "✅ Azure endpoint disabled - traffic routing to AWS"
+
+          # Verify AWS endpoint is healthy
+          sleep 10
+          AWS_HEALTH=$(curl -s "${{ secrets.AWS_APP_URL }}/api/health" | jq -r '.environment')
+          echo "AWS Environment: $AWS_HEALTH"
+
+      - name: Failback to Azure (re-enable Azure Traffic Manager endpoint)
+        if: github.event.inputs.action == 'failback-to-azure'
+        run: |
+          echo "🔄 Initiating failback to Azure..."
+
+          az network traffic-manager endpoint update \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --profile-name ${{ secrets.TM_PROFILE_NAME }} \
+            --name azure-primary \
+            --type azureEndpoints \
+            --endpoint-status Enabled
+
+          echo "✅ Azure endpoint re-enabled"
+
+      - name: Post failover summary
+        run: |
+          echo "## 🔄 Failover Action: ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: ${{ github.event.inputs.reason }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
