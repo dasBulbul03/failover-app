@@ -12,26 +12,18 @@ provider "aws" {
 }
 
 variable "aws_region" {
-  default = "us-east-1"
+  default = "ap-southeast-2"
 }
 
 variable "app_name" {
   default = "failover-app"
 }
 
-variable "db_password" {
-  sensitive = true
-}
-
-variable "container_image_uri" {
-  description = "ECR image URI for the app"
-}
-
 # ECR Repository
 resource "aws_ecr_repository" "app" {
   name                 = var.app_name
   image_tag_mutability = "MUTABLE"
-  
+
   image_scanning_configuration {
     scan_on_push = true
   }
@@ -41,23 +33,34 @@ resource "aws_ecr_repository" "app" {
 resource "aws_db_instance" "postgres" {
   identifier           = "${var.app_name}-pg"
   engine               = "postgres"
-  engine_version       = "16"
-  instance_class       = "db.t3.micro"
+  engine_version       = "16.9"
+  instance_class       = "db.t4g.micro"
   allocated_storage    = 20
   db_name              = "failoverdb"
   username             = "pgadmin"
   password             = var.db_password
   skip_final_snapshot  = true
   publicly_accessible  = true
-  
+
   tags = {
     Name = "${var.app_name}-postgres"
   }
 }
 
-# IAM Role for App Runner
-resource "aws_iam_role" "apprunner_role" {
-  name = "${var.app_name}-apprunner-role"
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = "failover-cluster"
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "ecs" {
+  name              = "/ecs/${var.app_name}"
+  retention_in_days = 7
+}
+
+# Execution Role
+resource "aws_iam_role" "ecs_execution" {
+  name = "ecsTaskExecutionRole"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -66,64 +69,20 @@ resource "aws_iam_role" "apprunner_role" {
         Action = "sts:AssumeRole"
         Effect = "Allow"
         Principal = {
-          Service = "build.apprunner.amazonaws.com"
+          Service = "ecs-tasks.amazonaws.com"
         }
       }
     ]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "apprunner_ecr" {
-  role       = aws_iam_role.apprunner_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess"
+resource "aws_iam_role_policy_attachment" "ecs_execution" {
+  role       = aws_iam_role.ecs_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# App Runner Service
-resource "aws_apprunner_service" "app" {
-  service_name = var.app_name
-
-  source_configuration {
-    image_repository {
-      image_identifier      = var.container_image_uri
-      image_repository_type = "ECR"
-      image_configuration {
-        port = "3000"
-        runtime_environment_variables = {
-          DATABASE_URL = "postgresql://pgadmin:${var.db_password}@${aws_db_instance.postgres.endpoint}/failoverdb?sslmode=require"
-          APP_ENV      = "aws"
-          REGION       = var.aws_region
-          NODE_ENV     = "production"
-        }
-      }
-    }
-    authentication_configuration {
-      access_role_arn = aws_iam_role.apprunner_role.arn
-    }
-    auto_deployments_enabled = true
-  }
-
-  health_check_configuration {
-    protocol            = "HTTP"
-    path                = "/api/health"
-    interval            = 10
-    timeout             = 5
-    healthy_threshold   = 1
-    unhealthy_threshold = 5
-  }
-
-  instance_configuration {
-    cpu    = "1024"
-    memory = "2048"
-  }
-
-  tags = {
-    Name        = var.app_name
-    Environment = "aws-secondary"
-  }
-}
-
-output "app_runner_url" {
-  value = "https://${aws_apprunner_service.app.service_url}"
+output "alb_dns_name" {
+  value = "failover-alb-97690356.ap-southeast-2.elb.amazonaws.com"
 }
 
 output "ecr_repository_url" {

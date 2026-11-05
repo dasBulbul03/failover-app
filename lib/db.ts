@@ -1,8 +1,16 @@
 import { Pool } from 'pg';
 
+let dbUrl = process.env.DATABASE_URL || '';
+// Strip sslmode from connection string if present to avoid driver conflicts
+if (dbUrl.includes('?sslmode=')) {
+  dbUrl = dbUrl.split('?sslmode=')[0];
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  connectionString: dbUrl,
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
 export async function query(text: string, params?: any[]) {
