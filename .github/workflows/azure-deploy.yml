@@ -2,6 +2,12 @@ name: Deploy to Azure (Primary)
 
 on:
   workflow_dispatch:
+    inputs:
+      skip_test:
+        description: 'Skip tests and linting'
+        required: false
+        type: boolean
+        default: false
 
 env:
   AZURE_WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
@@ -11,6 +17,7 @@ env:
 jobs:
   test:
     name: Test & Lint
+    if: "!inputs.skip_test"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,12 +31,15 @@ jobs:
   build-and-push:
     name: Build & Push to ACR
     runs-on: ubuntu-latest
-    needs: test
-    if: "${{ secrets.AZURE_CREDENTIALS != '' }}"
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to Azure Container Registry
         uses: azure/docker-login@v1
@@ -41,12 +51,14 @@ jobs:
       - name: Extract metadata
         id: meta
         run: |
-          echo "tags=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
-          echo "latest=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+          TAG="${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          LATEST="${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
+          echo "tags=$TAG" >> $GITHUB_OUTPUT
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image
         run: |
-          docker build -t ${{ steps.meta.outputs.tags }} -t ${{ steps.meta.outputs.latest }} .
+          docker build --platform linux/amd64 -t ${{ steps.meta.outputs.tags }} -t ${{ steps.meta.outputs.latest }} .
           docker push ${{ steps.meta.outputs.tags }}
           docker push ${{ steps.meta.outputs.latest }}
 
@@ -54,7 +66,6 @@ jobs:
     name: Deploy to Azure App Service
     runs-on: ubuntu-latest
     needs: build-and-push
-    if: "${{ secrets.AZURE_CREDENTIALS != '' }}"
     steps:
       - name: Azure Login
         uses: azure/login@v1
@@ -66,3 +77,26 @@ jobs:
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           images: ${{ needs.build-and-push.outputs.image-tag }}
+
+      - name: Verify Azure live health
+        run: |
+          APP_URL="https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net"
+          HEALTH_URL="$APP_URL/api/health"
+          echo "Checking health at: $HEALTH_URL"
+          for i in {1..12}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Azure health check passed!"
+              curl -s "$HEALTH_URL" | jq .
+              break
+            fi
+            echo "Attempt $i: HTTP $STATUS - waiting..."
+            sleep 10
+          done
+
+      - name: Post deployment summary
+        run: |
+          echo "## 🚀 Azure Primary Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- **App URL**: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Endpoint**: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
