@@ -26,13 +26,21 @@ export async function query(text: string, params?: any[]) {
   }
 }
 
-export async function initDb() {
-  await query(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id SERIAL PRIMARY KEY,
-      content TEXT NOT NULL,
-      author VARCHAR(100) NOT NULL DEFAULT 'Anonymous',
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    )
-  `);
+let initPromise: Promise<void> | null = null;
+
+export async function initDb(): Promise<void> {
+  if (!initPromise) {
+    initPromise = query(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        content TEXT NOT NULL,
+        author VARCHAR(100) NOT NULL DEFAULT 'Anonymous',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      )
+    `).then(() => {}).catch(err => {
+      initPromise = null;
+      throw err;
+    });
+  }
+  return initPromise;
 }

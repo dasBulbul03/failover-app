@@ -22,7 +22,7 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - run: npm run lint --if-present
+      - run: npm test
 
   build-and-deploy:
     name: Build & Push to ECR & Update ECS

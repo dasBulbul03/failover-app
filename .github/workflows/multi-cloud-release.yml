@@ -24,7 +24,7 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - run: npm run lint --if-present
+      - run: npm test
 
   deploy-azure:
     name: Deploy to Azure (Primary)
