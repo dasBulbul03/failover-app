@@ -1,286 +1,462 @@
-# FailoverApp — Multi-Cloud Active-Passive Failover System
+# FailoverApp — Multi-Cloud Disaster Recovery & Failover Engineering Guide
 
-A resilient, production-ready full-stack application built with **Next.js 14 (App Router)** and **PostgreSQL**, engineered to demonstrate automated and manual multi-cloud disaster recovery and failover between **Microsoft Azure (Primary)** and **Amazon Web Services (Secondary)**.
+A comprehensive, production-grade guide to the **FailoverApp** architecture: an active-passive, multi-cloud disaster recovery system spanning **Microsoft Azure (Primary)** and **Amazon Web Services (Secondary)**, powered by a containerized **Next.js 14 App Router** service and **PostgreSQL**.
 
 ---
 
 ## Table of Contents
 
-1. [Architecture Overview](#1-architecture-overview)
-   - [System Context & Traffic Flow](#system-context--traffic-flow)
-   - [Cloud Workload Topology](#cloud-workload-topology)
-   - [Database & Data Persistence](#database--data-persistence)
-2. [Software Architecture & Tech Stack](#2-software-architecture--tech-stack)
-   - [Application Layer](#application-layer)
-   - [Containerization](#containerization)
-3. [API Reference & Health Probing](#3-api-reference--health-probing)
-   - [Health Check (`/api/health`)](#health-check-apihealth)
-   - [Messages API (`/api/messages`)](#messages-api-apimessages)
-4. [Infrastructure as Code (IaC)](#4-infrastructure-as-code-iac)
-   - [AWS Infrastructure (ECS Fargate + RDS + ALB)](#aws-infrastructure-ecs-fargate--rds--alb)
-   - [Azure Infrastructure (App Service + PostgreSQL Flexible)](#azure-infrastructure-app-service--postgresql-flexible)
-5. [CI/CD Pipelines](#5-cicd-pipelines)
-   - [Workflow Catalog](#workflow-catalog)
-   - [Required Repository Secrets](#required-repository-secrets)
-6. [Multi-Cloud Failover Playbook](#6-multi-cloud-failover-playbook)
-   - [Automated DNS Failover](#automated-dns-failover)
-   - [Manual Failover via GitHub Actions](#manual-failover-via-github-actions)
-7. [Local Development & Testing](#7-local-development--testing)
-   - [Quickstart with Docker Compose](#quickstart-with-docker-compose)
-   - [Manual Setup](#manual-setup)
-   - [Linting and Type Checking](#linting-and-type-checking)
-8. [Current Deployment Status](#8-current-deployment-status)
+1. [Executive Summary & Failure Model](#1-executive-summary--failure-model)
+2. [End-to-End System Execution Flow](#2-end-to-end-system-execution-flow)
+   - [Phase 1: Normal Operation (Healthy Azure Primary)](#phase-1-normal-operation-healthy-azure-primary)
+   - [Phase 2: Outage Detection & Automated Failover](#phase-2-outage-detection--automated-failover)
+   - [Phase 3: Active Serving on AWS Secondary](#phase-3-active-serving-on-aws-secondary)
+   - [Phase 4: Restoration & Failback](#phase-4-restoration--failback)
+3. [Deep Infrastructure Specification](#3-deep-infrastructure-specification)
+   - [AWS Infrastructure Stack (ap-southeast-2)](#aws-infrastructure-stack-ap-southeast-2)
+   - [Azure Infrastructure Stack (eastus)](#azure-infrastructure-stack-eastus)
+   - [Global Traffic Management & DNS Layer](#global-traffic-management--dns-layer)
+4. [Software & Application Architecture](#4-software--application-architecture)
+   - [Application Runtime & Server Lifecycle](#application-runtime--server-lifecycle)
+   - [Data Layer, Connection Pooling & SSL](#data-layer-connection-pooling--ssl)
+   - [Containerization & Multi-Stage Build](#containerization--multi-stage-build)
+5. [CI/CD Automation Pipelines](#5-cicd-automation-pipelines)
+   - [Workflow 1: AWS Continuous Deployment (`aws-deploy.yml`)](#workflow-1-aws-continuous-deployment-aws-deployyml)
+   - [Workflow 2: Azure Continuous Deployment (`azure-deploy.yml`)](#workflow-2-azure-continuous-deployment-azure-deployyml)
+   - [Workflow 3: Multi-Cloud Synchronized Release (`multi-cloud-release.yml`)](#workflow-3-multi-cloud-synchronized-release-multi-cloud-releaseyml)
+   - [Workflow 4: Manual Disaster Recovery Drill (`failover-trigger.yml`)](#workflow-4-manual-disaster-recovery-drill-failover-triggeryml)
+6. [Data Consistency & Replication Strategy](#6-data-consistency--replication-strategy)
+7. [Operational Runbook & Verification Drills](#7-operational-runbook--verification-drills)
+8. [Local Development Guide](#8-local-development-guide)
+9. [Infrastructure State & Production Status](#9-infrastructure-state--production-status)
 
 ---
 
-## 1. Architecture Overview
+## 1. Executive Summary & Failure Model
 
-### System Context & Traffic Flow
+### The Objective
+To provide zero-downtime, continuous availability for a mission-critical web application even in the event of:
+1. Complete primary cloud datacenter/region blackout (e.g., Azure `eastus` goes dark).
+2. Compute infrastructure collapse (e.g., App Service crash loop or bad release).
+3. Primary database failure or connection exhaustion.
 
-The system employs an **Active-Passive Multi-Cloud Topology**. Normal user traffic is routed to Azure (Primary). Global DNS health checks continuously probe the `/api/health` endpoint. In the event of an Azure region degradation or outage, traffic automatically or manually diverts to AWS (Secondary).
+### Architecture At A Glance
+
+```
+                         ┌────────────────────────┐
+                         │   Global DNS Router    │
+                         │ (Azure Traffic Manager │
+                         │   or AWS Route 53)     │
+                         └───────────┬────────────┘
+                                     │
+           ┌─────────────────────────┴─────────────────────────┐
+           │ Priority 1 (Primary)                              │ Priority 2 (Standby)
+           ▼                                                   ▼
+┌─────────────────────────────────┐                 ┌─────────────────────────────────┐
+│     Microsoft Azure (eastus)    │                 │    Amazon Web Services (Sydney) │
+│                                 │                 │                                 │
+│  ┌───────────────────────────┐  │                 │  ┌───────────────────────────┐  │
+│  │     Azure App Service     │  │                 │  │ Application Load Balancer │  │
+│  │   (Linux Container B1)    │  │                 │  │  (failover-app-alb:80)    │  │
+│  └─────────────┬─────────────┘  │                 │  └─────────────┬─────────────┘  │
+│                │                │                 │                │ TCP:3000       │
+│                ▼                │                 │                ▼                │
+│  ┌───────────────────────────┐  │                 │  ┌───────────────────────────┐  │
+│  │ Azure Database PostgreSQL │  │                 │  │   ECS Fargate Container   │  │
+│  │     (Flexible Server)     │  │                 │  │ (failover-service, 0.25c) │  │
+│  └───────────────────────────┘  │                 │  └─────────────┬─────────────┘  │
+│                                 │                 │                │ TCP:5432       │
+│                                 │                 │                ▼                │
+│                                 │                 │  ┌───────────────────────────┐  │
+│                                 │                 │  │   Amazon RDS PostgreSQL   │  │
+│                                 │                 │  │   (Postgres 16, Private)  │  │
+│                                 │                 │  └───────────────────────────┘  │
+└─────────────────────────────────┘                 └─────────────────────────────────┘
+```
+
+---
+
+## 2. End-to-End System Execution Flow
+
+### Complete Sequence Diagram
 
 ```mermaid
-flowchart TD
-    User([Internet Users / Clients]) --> DNS[DNS Routing Layer: Azure Traffic Manager / Route 53]
+sequenceDiagram
+    autonumber
+    actor Client as User / Browser
+    participant DNS as Traffic Manager / Route 53
+    participant AzureApp as Azure App Service (eastus)
+    participant AzureDB as Azure PostgreSQL
+    participant AWSALB as AWS ALB (ap-southeast-2)
+    participant AWSECS as AWS ECS Fargate
+    participant AWSRDS as AWS RDS PostgreSQL
 
-    subgraph Primary ["🟢 Azure Cloud (Primary Region - East US)"]
-        TM_Azure[Priority 1 Endpoint]
-        AppService[Azure App Service: Linux Web App]
-        AzureDB[(Azure Database for PostgreSQL)]
-        AppService --> AzureDB
+    Note over DNS,AzureApp: Phase 1: Normal Active Operation
+    loop Every 10-30 seconds
+        DNS->>AzureApp: GET /api/health (Health Probe)
+        AzureApp->>AzureDB: SELECT 1
+        AzureDB-->>AzureApp: OK
+        AzureApp-->>DNS: HTTP 200 {"status":"ok","db":"ok"} (Healthy)
     end
+    Client->>DNS: Resolve DNS for failover-app.com
+    DNS-->>Client: Returns Azure App Service CNAME / IP
+    Client->>AzureApp: GET / (Loads Web Dashboard)
+    Client->>AzureApp: POST /api/messages (Writes message)
+    AzureApp->>AzureDB: INSERT INTO messages (...)
+    AzureDB-->>AzureApp: 201 Created
+    AzureApp-->>Client: JSON Response
 
-    subgraph Secondary ["🟠 AWS Cloud (Secondary Region - Sydney ap-southeast-2)"]
-        TM_AWS[Priority 2 Endpoint]
-        ALB[Application Load Balancer]
-        ECS[ECS Fargate Tasks: failover-service]
-        RDS[(Amazon RDS: PostgreSQL 16)]
-        ALB --> ECS
-        ECS --> RDS
-    end
+    Note over AzureApp,AzureDB: Phase 2: Failure Occurs (Azure DB or App crashes)
+    AzureApp--xAzureDB: Database Unreachable / App Outage
+    DNS->>AzureApp: GET /api/health
+    AzureApp-->>DNS: HTTP 500 or Connection Timeout
+    Note over DNS: Threshold exceeded (3 consecutive failures). Azure marked DEGRADED!
 
-    DNS -- "Normal Traffic (Priority 1)" --> TM_Azure --> AppService
-    DNS -. "Failover Traffic (On Failure / Drill)" .-> TM_AWS --> ALB
+    Note over Client,AWSRDS: Phase 3: Failover to AWS Secondary
+    Client->>DNS: Resolve DNS (TTL = 60s expires)
+    DNS-->>Client: Returns AWS ALB DNS Name (ap-southeast-2)
+    Client->>AWSALB: GET /
+    AWSALB->>AWSECS: Forward request (port 3000)
+    AWSECS->>AWSRDS: SELECT * FROM messages
+    AWSRDS-->>AWSECS: Records returned
+    AWSECS-->>AWSALB-->>Client: UI renders with "AWS" Orange Badge
+
+    Note over AzureApp,DNS: Phase 4: Recovery & Failback
+    AzureApp->>AzureDB: Connection restored
+    DNS->>AzureApp: GET /api/health
+    AzureApp-->>DNS: HTTP 200 OK
+    Note over DNS: Azure marked ONLINE. Priority 1 resumes.
+    Client->>DNS: Next query resolves back to Azure.
 ```
 
-### Cloud Workload Topology
+---
 
-| Layer | Microsoft Azure (Primary) | Amazon Web Services (Secondary) |
+### Step-by-Step Flow Breakdown
+
+#### Phase 1: Normal Operation (Healthy Azure Primary)
+1. **DNS Query**: The user's browser issues a DNS resolution request for the domain (e.g., `app.domain.com`).
+2. **Priority Evaluation**: Azure Traffic Manager or AWS Route 53 evaluates its routing table:
+   - Endpoint 1 (Azure App Service): Priority `1`, Status: `ONLINE`.
+   - Endpoint 2 (AWS ALB): Priority `2`, Status: `ONLINE` (Standby).
+3. **Ingress**: DNS resolves to Azure. The browser initiates TLS/TCP handshake with Azure App Service.
+4. **App Execution**: Node.js Next.js server processes the request, pulls a pooled connection from `pg.Pool`, writes or reads from Azure PostgreSQL Flexible Server, and returns the response.
+5. **UI Detection**: The UI renders with a **Blue Badge: `Azure (eastus)`** reflecting `APP_ENV=azure`.
+
+#### Phase 2: Outage Detection & Automated Failover
+1. **Health Check Probing**: The global DNS service sends an HTTP `GET /api/health` request to both Azure and AWS every 10–30 seconds.
+2. **Deep Health Check**: `/api/health` does **not** simply return a static string. It actively runs `SELECT 1` on PostgreSQL.
+3. **Threshold Breach**: If Azure App Service crashes or Azure PostgreSQL stops answering:
+   - Probe attempt 1 fails (timeout / 500).
+   - Probe attempt 2 fails.
+   - Probe attempt 3 fails (Tolerance threshold breached).
+4. **Endpoint Demotion**: DNS Router marks Azure as `DEGRADED`.
+5. **DNS Propagation**: Because Priority 1 is degraded, the DNS router immediately begins returning Priority 2 (AWS ALB) on all new DNS queries. Clients switch over as soon as their 60-second DNS TTL expires.
+
+#### Phase 3: Active Serving on AWS Secondary
+1. **Client Reroute**: All subsequent HTTP requests hit the AWS Application Load Balancer (`failover-app-alb`) in Sydney (`ap-southeast-2`).
+2. **VPC Routing**:
+   - The ALB terminates HTTP on port 80 and forwards traffic to private ECS Fargate tasks on target port 3000.
+   - Security group `ecs-tasks-sg` allows traffic **only** from `alb-sg`.
+3. **AWS Database Execution**: The Next.js container connects to Amazon RDS PostgreSQL 16 via the internal VPC network on port 5432.
+4. **UI Detection**: The UI auto-refreshes every 10 seconds. The badge turns **Orange: `AWS (ap-southeast-2)`** reflecting `APP_ENV=aws`.
+
+#### Phase 4: Restoration & Failback
+1. Once Azure repairs its database or service, `/api/health` returns `200 OK`.
+2. DNS router records consecutive successful probes and restores Azure to `ONLINE`.
+3. Because Azure is configured as **Priority 1**, DNS routing resumes sending traffic to Azure.
+
+---
+
+## 3. Deep Infrastructure Specification
+
+### AWS Infrastructure Stack (`ap-southeast-2`)
+
+Managed via Infrastructure as Code in [`infra/aws/main.tf`](infra/aws/main.tf):
+
+```
+                        VPC (Default VPC: 172.31.0.0/16)
+ ┌──────────────────────────────────────────────────────────────────────────┐
+ │ Public Subnets (ap-southeast-2a, ap-southeast-2b, ap-southeast-2c)      │
+ │                                                                          │
+ │   ┌───────────────────────┐                                              │
+ │   │  Internet Gateway     │                                              │
+ │   └──────────┬────────────┘                                              │
+ │              │                                                           │
+ │              ▼                                                           │
+ │   ┌───────────────────────┐     Security Group: failover-app-alb-sg      │
+ │   │ Application Load      │     - Inbound: Port 80 (0.0.0.0/0)           │
+ │   │ Balancer (ALB)        │     - Outbound: All                          │
+ │   └──────────┬────────────┘                                              │
+ │              │ Target Group: failover-app-tg (Port 3000, Target: IP)     │
+ │              ▼                                                           │
+ │   ┌───────────────────────┐     Security Group: failover-app-ecs-tasks-sg│
+ │   │ ECS Fargate Tasks     │     - Inbound: Port 3000 (from ALB-SG only)  │
+ │   │ (0.25 vCPU, 512MB RAM)│     - Outbound: All                          │
+ │   └──────────┬────────────┘                                              │
+ │              │ TCP: 5432                                                 │
+ │              ▼                                                           │
+ │   ┌───────────────────────┐     Security Group: failover-app-rds-sg      │
+ │   │ Amazon RDS PostgreSQL │     - Inbound: Port 5432 (from ECS-SG only)  │
+ │   │ (db.t4g.micro, 20GB)  │     - Publicly Accessible: FALSE (Secured)   │
+ │   └───────────────────────┘                                              │
+ └──────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Detailed AWS Resource Breakdown
+
+| Resource Type | Resource Name | Key Configuration Attributes |
 | :--- | :--- | :--- |
-| **Compute Form Factor** | Azure App Service (Linux Web App, Node 20 LTS) | AWS ECS Fargate (Serverless Containers, 0.25 vCPU / 512 MB) |
-| **Ingress / Load Balancer** | Azure App Service Default Ingress (`azurewebsites.net`) | AWS Application Load Balancer (`aws_lb`) with HTTP/80 Listener |
-| **Container Registry** | Azure Container Registry (ACR) | Amazon Elastic Container Registry (ECR) |
-| **Database** | Azure Database for PostgreSQL Flexible Server | Amazon RDS for PostgreSQL 16 (Private subnet, db.t4g.micro) |
-| **Logging & Monitoring** | Azure Log Analytics & App Service Diagnostics | Amazon CloudWatch Log Group (`/ecs/failover-app`, 7-day retention) |
-| **Region** | `eastus` | `ap-southeast-2` (Sydney) |
+| **VPC & Subnets** | Default VPC | Auto-discovered by Terraform data source across all Availability Zones in `ap-southeast-2`. |
+| **Security Group (ALB)** | `failover-app-alb-sg` | Ingress: Port `80` (HTTP) from `0.0.0.0/0`. Egress: All. |
+| **Security Group (ECS)** | `failover-app-ecs-tasks-sg`| Ingress: Port `3000` restricted strictly to `failover-app-alb-sg`. Egress: All. |
+| **Security Group (RDS)** | `failover-app-rds-sg` | Ingress: Port `5432` restricted strictly to `failover-app-ecs-tasks-sg`. No public access. |
+| **Application Load Balancer** | `failover-app-alb` | Public internet-facing ALB. Attached to subnets across all AZs. |
+| **ALB Target Group** | `failover-app-tg` | Target Type: `ip`. Port: `3000`, Protocol: `HTTP`. Health Check: `/api/health`, interval `15s`, timeout `5s`, threshold `2`, code `200`. |
+| **ECS Cluster** | `failover-cluster` | Managed ECS Container Cluster. |
+| **ECS Task Definition** | `failover-app` | Fargate launch type. CPU: `256` (0.25 vCPU), Memory: `512` MB. Network Mode: `awsvpc`. Contains single container on port `3000`. |
+| **ECS Service** | `failover-service` | Launch Type: `FARGATE`. Desired Count: `1`. Connected to `failover-app-tg`. Assigns public IP for outbound ECR pulls. |
+| **Container Registry** | `failover-app` (ECR) | Scan on push: `true`. Mutability: `MUTABLE`. |
+| **Relational Database** | `failover-app-pg` (RDS) | Engine: `postgres 16`. Class: `db.t4g.micro`. Storage: `20 GB gp3`. Subnet Group: default VPC subnets. `publicly_accessible = false`. |
+| **Logging** | `/ecs/failover-app` | CloudWatch Log Group with 7-day retention. Stream prefix: `ecs`. |
+| **IAM Execution Role** | `failover-app-ecsTaskExecutionRole` | Grants Fargate agent permission to pull from ECR and stream logs to CloudWatch. |
+| **IAM Task Role** | `failover-app-ecsTaskRole` | Container application runtime role. |
 
-### Database & Data Persistence
+---
 
-- **Schema Definition**: The database holds a `messages` table storing board submissions:
-  ```sql
-  CREATE TABLE IF NOT EXISTS messages (
-    id SERIAL PRIMARY KEY,
-    content TEXT NOT NULL,
-    author VARCHAR(100) NOT NULL DEFAULT 'Anonymous',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-  );
+### Azure Infrastructure Stack (`eastus`)
+
+Managed via Infrastructure as Code in [`infra/azure/main.tf`](infra/azure/main.tf) and [`infra/azure/main.bicep`](infra/azure/main.bicep):
+
+| Resource Type | Resource Name | Key Configuration Attributes |
+| :--- | :--- | :--- |
+| **Resource Group** | `failover-rg` | Location: `eastus`. |
+| **App Service Plan** | `failover-app-plan` | OS: `Linux`. SKU: `B1` (Basic compute tier, 1 vCPU, 1.75 GB RAM). |
+| **Web App** | `failover-app-<random>` | Linux Web App running Docker container. `always_on = true`. Health Check Path: `/api/health`. |
+| **App Settings** | Environment Variables | `DATABASE_URL`, `APP_ENV=azure`, `REGION=eastus`, `NODE_ENV=production`. |
+| **PostgreSQL Server** | `failover-app-pg-<random>` | Azure Database for PostgreSQL Flexible Server. Version `16`. SKU: `B_Standard_B1ms`. Storage: `32 GB`. |
+| **Database** | `failoverdb` | UTF-8 collation database. |
+| **Container Registry** | Azure Container Registry (ACR) | Hosts application Docker image. |
+
+---
+
+### Global Traffic Management & DNS Layer
+
+Detailed in [`infra/dns/failover-setup.md`](infra/dns/failover-setup.md):
+- **Routing Engine**: Azure Traffic Manager (or AWS Route 53 Traffic Flow).
+- **Routing Algorithm**: **Priority Routing** (Active-Passive).
+- **TTL**: `60 seconds` (balances cache efficiency against failover reaction time).
+- **Health Probing Engine**:
+  - Protocol: `HTTP`
+  - Port: `80` (or `443` HTTPS with custom domain TLS)
+  - Path: `/api/health`
+  - Probe Interval: `10` to `30` seconds
+  - Timeout: `5` to `10` seconds
+  - Degraded Threshold: `3` failed probes
+
+---
+
+## 4. Software & Application Architecture
+
+### Application Runtime & Server Lifecycle
+- Built on **Next.js 14 App Router** (`app/layout.tsx`, `app/page.tsx`).
+- Standalone output mode enabled in `next.config.js`:
+  ```javascript
+  module.exports = {
+    output: 'standalone',
+  };
   ```
-- **Connection Management ([lib/db.ts](lib/db.ts))**:
-  - Connection pooling via `pg.Pool`.
-  - Conditional SSL negotiation: enforces SSL for production clouds (RDS/Azure) while keeping local Docker connections unencrypted.
-  - Runtime memoization: table initialization runs once per container lifecycle, preventing database catalog contention.
+  This creates an isolated, self-contained `server.js` file with minimal `node_modules` dependencies, reducing Docker image size to ~150MB.
 
----
+### Data Layer, Connection Pooling & SSL ([lib/db.ts](lib/db.ts))
 
-## 2. Software Architecture & Tech Stack
+```typescript
+import { Pool, PoolConfig } from 'pg';
 
-### Application Layer
-- **Framework**: Next.js 14 with App Router (`app/` directory).
-- **Language**: TypeScript 5 (`strict: true`).
-- **Styling**: Tailwind CSS with auto-refresh UI (polls every 10 seconds).
-- **Environment Detection**: The client UI displays an interactive badge indicating active cloud provider (`azure` vs `aws`) and datacenter region from runtime environment variables (`APP_ENV`, `REGION`).
+let dbUrl = process.env.DATABASE_URL || '';
+const requiresSsl = dbUrl.includes('sslmode=require') || 
+  (process.env.NODE_ENV === 'production' && !dbUrl.includes('localhost') && !dbUrl.includes('@db:'));
 
-### Containerization
-- **Dockerfile ([Dockerfile](Dockerfile))**:
-  - **Stage 1 (deps)**: Installs production dependencies using `npm ci` on `node:20-alpine`.
-  - **Stage 2 (builder)**: Compiles the Next.js application into a standalone bundle (`output: 'standalone'`).
-  - **Stage 3 (runner)**: Minimal runtime container using a locked non-root user (`nextjs:nodejs`, UID 1001). Exposes port `3000`.
+// Strip query string params to prevent driver collisions
+if (dbUrl.includes('?')) {
+  dbUrl = dbUrl.split('?')[0];
+}
 
----
+const poolConfig: PoolConfig = {
+  connectionString: dbUrl,
+  ...(requiresSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+};
 
-## 3. API Reference & Health Probing
-
-### Health Check (`/api/health`)
-
-Used by DNS failover controllers (Azure Traffic Manager, AWS Route 53, Cloudflare Health Checks) to verify compute and database health.
-
-- **Method**: `GET`
-- **Response Headers**: `Cache-Control: no-cache, no-store`
-- **Success Response (`200 OK`)**:
-  ```json
-  {
-    "status": "ok",
-    "environment": "aws",
-    "db": "ok",
-    "timestamp": "2026-11-20T16:19:49.240Z",
-    "region": "ap-southeast-2"
-  }
-  ```
-- **Failure Behavior**: If PostgreSQL is unreachable, `db` returns `"error"`.
-
-### Messages API (`/api/messages`)
-
-- `GET /api/messages`: Returns the 50 most recent messages.
-- `POST /api/messages`: Creates a message. Body: `{"content": "string", "author": "string"}`.
-- `DELETE /api/messages/:id`: Deletes a specific message by its integer ID.
-
----
-
-## 4. Infrastructure as Code (IaC)
-
-### AWS Infrastructure (ECS Fargate + RDS + ALB)
-Located in [`infra/aws/`](infra/aws/).
-
-* **[main.tf](infra/aws/main.tf)**:
-  - Discovers default VPC and subnets dynamically.
-  - Provisions ALB with target group routing `/api/health` checks to port 3000.
-  - Creates least-privilege security groups:
-    - `alb-sg`: Inbound HTTP 80 from `0.0.0.0/0`.
-    - `ecs-tasks-sg`: Inbound TCP 3000 from `alb-sg` only.
-    - `rds-sg`: Inbound TCP 5432 from `ecs-tasks-sg` only.
-  - Provisions private RDS PostgreSQL 16 instance.
-  - Deploys ECS Fargate Task Definition and Service (`failover-service`).
-* **[variables.tf](infra/aws/variables.tf)**: Region (`ap-southeast-2`), application name, and database credentials.
-* **[outputs.tf](infra/aws/outputs.tf)**: Exports live ALB DNS name, health check URL, and ECR repository URL.
-* **[deploy.sh](infra/aws/deploy.sh)**: Automates multi-arch Docker builds (`linux/amd64`), ECR push, and ECS rolling deployments.
-
-### Azure Infrastructure (App Service + PostgreSQL Flexible)
-Located in [`infra/azure/`](infra/azure/).
-
-* **[main.tf](infra/azure/main.tf)**: Defines Resource Group, Linux App Service Plan (B1), PostgreSQL Flexible Server (Burstable B1ms), and Web App.
-* **[main.bicep](infra/azure/main.bicep)**: Azure-native Bicep template alternative for automated CLI deployments.
-* **[deploy.sh](infra/azure/deploy.sh)**: One-click script to deploy the Bicep template via `az deployment group create`.
-
----
-
-## 5. CI/CD Pipelines
-
-GitHub Actions workflows are located in [`.github/workflows/`](.github/workflows/):
-
-### Workflow Catalog
-
-```
-.github/workflows/
-├── aws-deploy.yml              # Triggered on push to main (or manual dispatch) -> Deploys to AWS ECS
-├── azure-deploy.yml            # Manual trigger (or promote) -> Deploys to Azure Web App
-├── multi-cloud-release.yml     # Orchestrates parallel/selective release to both clouds
-└── failover-trigger.yml        # On-demand manual drill: toggles Traffic Manager endpoints
+const pool = new Pool(poolConfig);
 ```
 
-1. **[aws-deploy.yml](.github/workflows/aws-deploy.yml)**:
-   - Steps: Checkout → Node 20 Setup → `npm ci` → `npm test` (ESLint + TypeScript type check) → AWS OIDC/Key Authentication → Docker Buildx (`linux/amd64`) → Push ECR → `aws ecs update-service --force-new-deployment` → Automated HTTP 200 verification on live ALB.
-2. **[azure-deploy.yml](.github/workflows/azure-deploy.yml)**:
-   - Steps: Quality Gates → Azure Docker Login → ACR Build & Push → Deploy Web App Container → Probe live Azure health check.
-3. **[multi-cloud-release.yml](.github/workflows/multi-cloud-release.yml)**:
-   - Allows selecting deployment targets (`both`, `azure-only`, or `aws-only`).
-   - Runs test suites once, pushes images to both cloud registries, and reports a side-by-side release status matrix in the GitHub Step Summary.
-4. **[failover-trigger.yml](.github/workflows/failover-trigger.yml)**:
-   - Takes input action `failover-to-aws` or `failback-to-azure`.
-   - Modifies Azure Traffic Manager endpoint status using the Azure CLI and verifies secondary endpoint health.
+#### Key Reliability Patterns:
+1. **Adaptive SSL**: Bypasses SSL on local Docker networks (`@db:5432`) while enforcing TLS encryption on AWS RDS and Azure Flexible PostgreSQL.
+2. **Table Initialization Memoization**:
+   ```typescript
+   let initPromise: Promise<void> | null = null;
+   export async function initDb(): Promise<void> {
+     if (!initPromise) {
+       initPromise = query(`CREATE TABLE IF NOT EXISTS messages (...)`)
+         .catch(err => { initPromise = null; throw err; });
+     }
+     return initPromise;
+   }
+   ```
+   Ensures `CREATE TABLE IF NOT EXISTS` executes **exactly once per container lifecycle**, eliminating database catalog locking on high-frequency API calls.
 
-### Required Repository Secrets
+### Containerization & Multi-Stage Build ([Dockerfile](Dockerfile))
 
-Configure the following secrets in **GitHub Repository Settings > Secrets and variables > Actions**:
+```mermaid
+flowchart LR
+    subgraph S1 ["Stage 1: deps"]
+        A[node:20-alpine] --> B[Install libc6-compat]
+        B --> C[npm ci]
+    end
+    subgraph S2 ["Stage 2: builder"]
+        D[Copy node_modules] --> E[npm run build]
+        E --> F[Generate .next/standalone]
+    end
+    subgraph S3 ["Stage 3: runner"]
+        G[Add user nextjs:1001] --> H[Copy standalone & static]
+        H --> I[USER nextjs]
+        I --> J[CMD: node server.js]
+    end
+    S1 --> S2 --> S3
+```
 
-| Secret Name | Cloud | Purpose |
-| :--- | :---: | :--- |
-| `AWS_ACCESS_KEY_ID` | AWS | IAM user access key for CI deployments |
-| `AWS_SECRET_ACCESS_KEY` | AWS | IAM user secret access key |
-| `AWS_ALB_DNS` | AWS | *(Optional)* Override ALB DNS name for health verification |
-| `AZURE_CREDENTIALS` | Azure | Service principal JSON credentials (`az ad sp create-for-rbac`) |
-| `AZURE_WEBAPP_NAME` | Azure | Azure Linux Web App resource name |
-| `ACR_LOGIN_SERVER` | Azure | Azure Container Registry login domain (e.g. `myregistry.azurecr.io`) |
-| `ACR_USERNAME` | Azure | ACR admin or service principal username |
-| `ACR_PASSWORD` | Azure | ACR access password |
-| `AZURE_RESOURCE_GROUP` | Azure | Resource group containing Traffic Manager profile |
-| `TM_PROFILE_NAME` | Azure | Azure Traffic Manager profile name |
-
----
-
-## 6. Multi-Cloud Failover Playbook
-
-### Automated DNS Failover
-
-Configured using **Azure Traffic Manager** or **AWS Route 53**:
-1. Create a Traffic Manager profile with **Priority Routing** (TTL: 60 seconds).
-2. Set **Endpoint 1 (Primary)** to Azure App Service (`azurewebsites.net`), Priority `1`.
-3. Set **Endpoint 2 (Secondary)** to AWS ALB DNS name, Priority `2`.
-4. Monitor probe: Protocol `HTTP`/`HTTPS`, Port `80`/`443`, Path `/api/health`.
-
-### Manual Failover via GitHub Actions
-
-To simulate a disaster recovery scenario or perform zero-downtime maintenance:
-1. Navigate to **Actions** in GitHub.
-2. Select **Manual Failover Trigger** and click **Run workflow**.
-3. Choose:
-   - `failover-to-aws`: Disables the primary Azure endpoint, forcing 100% of incoming DNS traffic to AWS.
-   - `failback-to-azure`: Re-enables the primary endpoint once Azure service is restored.
+- **Security Compliance**: Uses non-root user `nextjs` (UID 1001), preventing container breakout exploits.
+- **Minimal Surface**: DevDependencies and package managers are stripped from the final runtime container.
 
 ---
 
-## 7. Local Development & Testing
+## 5. CI/CD Automation Pipelines
+
+Four integrated GitHub Actions workflows automate building, testing, deploying, and failing over:
+
+### Workflow 1: AWS Continuous Deployment (`aws-deploy.yml`)
+- **Trigger**: Automatic on `push` to `main`, or manual `workflow_dispatch`.
+- **Pipeline Stages**:
+  ```
+  [Test & Lint] ──> [AWS Auth] ──> [Docker Buildx] ──> [Push ECR] ──> [ECS Force Deploy] ──> [Health Verification Loop]
+  ```
+- **Automated Verification Loop**: The pipeline executes an active polling loop against the ALB:
+  ```bash
+  for i in {1..12}; do
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL")
+    if [ "$STATUS" = "200" ]; then break; fi
+    sleep 10
+  done
+  ```
+
+### Workflow 2: Azure Continuous Deployment (`azure-deploy.yml`)
+- **Trigger**: Manual `workflow_dispatch` (promotes images to Azure Primary).
+- **Pipeline Stages**:
+  - Tests & Linting.
+  - Builds and tags image for Azure Container Registry (ACR).
+  - Deploys container image to Azure Linux Web App via `azure/webapps-deploy@v3`.
+  - Verifies `/api/health` on Azure endpoint.
+
+### Workflow 3: Multi-Cloud Synchronized Release (`multi-cloud-release.yml`)
+- **Trigger**: `workflow_dispatch` with input choices: `both`, `azure-only`, or `aws-only`.
+- **Parallel Deployment**: Runs `deploy-azure` and `deploy-aws` concurrently after passing shared tests.
+- **Unified Markdown Matrix**: Renders a deployment comparison table in GitHub Step Summary.
+
+### Workflow 4: Manual Disaster Recovery Drill (`failover-trigger.yml`)
+- **Trigger**: Manual `workflow_dispatch`.
+- **Inputs**: `action` (`failover-to-aws` or `failback-to-azure`).
+- **Execution**: Invokes Azure CLI:
+  ```bash
+  az network traffic-manager endpoint update \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --profile-name "$TM_PROFILE_NAME" \
+    --name azure-primary \
+    --type azureEndpoints \
+    --endpoint-status Disabled
+  ```
+  Immediately forces all DNS traffic to AWS, and probes the AWS endpoint to verify that failover succeeded.
+
+---
+
+## 6. Data Consistency & Replication Strategy
+
+In an active-passive multi-cloud architecture, keeping data consistent across clouds without high latency is a primary architectural consideration.
+
+### Production Synchronization Strategies
+
+| Strategy | Architecture | Latency | Complexity | Best For |
+| :--- | :--- | :--- | :--- | :--- |
+| **PostgreSQL Logical Replication** | Native logical replication over cross-cloud IPSec VPN or WireGuard tunnel. | Low (< 1 second) | Medium | Relational data with read replica in secondary cloud. |
+| **Event-Driven CDC (Change Data Capture)** | Debezium captures WAL logs -> Kafka / EventBridge -> Writes to secondary DB. | Sub-second | High | Decoupled event-driven architectures. |
+| **Cloud-Agnostic Distributed DB** | CockroachDB or YugabyteDB spanning multi-cloud nodes with distributed consensus (Raft). | Immediate (Synchronous) | High | Zero-RPO and zero-RTO mission-critical platforms. |
+
+---
+
+## 7. Operational Runbook & Verification Drills
+
+### 1. Test Endpoint Health Manually
+
+Verify the secondary AWS endpoint:
+```bash
+curl -i http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com/api/health
+```
+Expected output:
+```json
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "status": "ok",
+  "environment": "aws",
+  "db": "ok",
+  "timestamp": "2026-11-20T16:19:49.240Z",
+  "region": "ap-southeast-2"
+}
+```
+
+### 2. Post a Test Message
+```bash
+curl -X POST http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com/api/messages \
+  -H "Content-Type: application/json" \
+  -d '{"content": "Simulating disaster recovery event", "author": "Site Reliability Engineer"}'
+```
+
+### 3. Fetch Stored Messages
+```bash
+curl -s http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com/api/messages | jq .
+```
+
+---
+
+## 8. Local Development Guide
 
 ### Quickstart with Docker Compose
 
-Spin up a local PostgreSQL 16 database and the Next.js app in one command:
+Run the complete stack (PostgreSQL + Next.js App) locally:
 
 ```bash
 docker compose up --build
 ```
-- Web Application: [http://localhost:3000](http://localhost:3000)
-- PostgreSQL Database: `localhost:5432` (`user: postgres`, `password: postgres`, `db: failoverdb`)
 
-### Manual Setup
+- **Web Dashboard**: Open [http://localhost:3000](http://localhost:3000)
+- **Local Health Check**: [http://localhost:3000/api/health](http://localhost:3000/api/health)
+- **Database**: PostgreSQL 16 on `localhost:5432` (`postgres:postgres`, DB: `failoverdb`)
 
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/dasBulbul03/failover-app.git
-   cd failover-app
-   ```
-2. **Configure environment variables**:
-   ```bash
-   cp .env.local.example .env.local
-   ```
-   Edit `.env.local`:
-   ```env
-   DATABASE_URL=postgresql://postgres:postgres@localhost:5432/failoverdb
-   APP_ENV=local
-   REGION=local
-   ```
-3. **Install dependencies**:
-   ```bash
-   npm install
-   ```
-4. **Run development server**:
-   ```bash
-   npm run dev
-   ```
+### Running Verification Suite
 
-### Linting and Type Checking
-
-Run the full CI validation suite locally:
+Before pushing changes, run the automated quality gate:
 
 ```bash
 npm test
 ```
-*Executes `next lint` followed by `tsc --noEmit`.*
+*Runs ESLint rules followed by full TypeScript type checking (`tsc --noEmit`).*
 
 ---
 
-## 8. Current Deployment Status
+## 9. Infrastructure State & Production Status
 
-- **AWS Secondary Deployment**: **LIVE & HEALTHY** 🟢
-  - **Load Balancer Endpoint**: `http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com`
-  - **Health Check Probe**: `http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com/api/health`
+- **AWS Secondary Deployment**: **LIVE & OPERATIONAL** 🟢
+  - **ALB DNS**: `failover-alb-97690356.ap-southeast-2.elb.amazonaws.com`
+  - **Cluster**: `failover-cluster` (ECS Fargate)
+  - **Service**: `failover-service` (1 running task)
   - **Region**: `ap-southeast-2` (Sydney)
-- **Azure Primary Deployment**: Pending credential provisioning in GitHub Secrets.
+- **Terraform State Notice**: The live AWS infrastructure was provisioned and tested in `ap-southeast-2`. If you wish to manage these live resources through Terraform, use `terraform import` to bind them to a centralized S3 remote state backend.
