@@ -1,17 +1,20 @@
-import { Pool } from 'pg';
+import { Pool, PoolConfig } from 'pg';
 
 let dbUrl = process.env.DATABASE_URL || '';
-// Strip sslmode from connection string if present to avoid driver conflicts
-if (dbUrl.includes('?sslmode=')) {
-  dbUrl = dbUrl.split('?sslmode=')[0];
+const requiresSsl = dbUrl.includes('sslmode=require') || 
+  (process.env.NODE_ENV === 'production' && !dbUrl.includes('localhost') && !dbUrl.includes('@db:'));
+
+// Strip query parameters from connection string to avoid driver conflicts
+if (dbUrl.includes('?')) {
+  dbUrl = dbUrl.split('?')[0];
 }
 
-const pool = new Pool({
+const poolConfig: PoolConfig = {
   connectionString: dbUrl,
-  ssl: {
-    rejectUnauthorized: false,
-  },
-});
+  ...(requiresSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+};
+
+const pool = new Pool(poolConfig);
 
 export async function query(text: string, params?: any[]) {
   const client = await pool.connect();

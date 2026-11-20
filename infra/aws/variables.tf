@@ -1,7 +1,13 @@
 variable "aws_region" {
-  description = "AWS region for secondary deployment"
+  description = "AWS region for deployment"
   type        = string
-  default     = "us-east-1"
+  default     = "ap-southeast-2"
+}
+
+variable "app_name" {
+  description = "Application name used for all resource naming"
+  type        = string
+  default     = "failover-app"
 }
 
 variable "db_password" {
@@ -11,12 +17,7 @@ variable "db_password" {
 }
 
 variable "container_image_uri" {
-  description = "ECR image URI (account.dkr.ecr.region.amazonaws.com/name:tag)"
+  description = "ECR image URI. If empty, defaults to repository_url:latest"
   type        = string
-}
-
-variable "app_name" {
-  description = "Application name used for all resource naming"
-  type        = string
-  default     = "failover-app"
+  default     = ""
 }

@@ -63,10 +63,22 @@ jobs:
             --force-new-deployment \
             --region $AWS_REGION
 
+      - name: Resolve ALB Endpoint
+        id: alb
+        run: |
+          ALB_DNS=$(aws elbv2 describe-load-balancers --names "failover-app-alb" --region "$AWS_REGION" --query "LoadBalancers[0].DNSName" --output text 2>/dev/null || echo "")
+          if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" = "None" ]; then
+            ALB_DNS="${{ secrets.AWS_ALB_DNS || 'failover-alb-97690356.ap-southeast-2.elb.amazonaws.com' }}"
+          fi
+          echo "dns_name=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "Resolved ALB DNS: $ALB_DNS"
+
       - name: Verify live endpoint health
+        env:
+          ALB_DNS: ${{ steps.alb.outputs.dns_name }}
         run: |
           sleep 20
-          HEALTH_URL="http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com/api/health"
+          HEALTH_URL="http://$ALB_DNS/api/health"
           echo "Checking health at: $HEALTH_URL"
           for i in {1..12}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
@@ -80,8 +92,10 @@ jobs:
           done
 
       - name: Post deployment summary
+        env:
+          ALB_DNS: ${{ steps.alb.outputs.dns_name }}
         run: |
           echo "## 🚀 AWS Deployment Complete" >> $GITHUB_STEP_SUMMARY
-          echo "- **App URL**: http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com" >> $GITHUB_STEP_SUMMARY
-          echo "- **Health Endpoint**: http://failover-alb-97690356.ap-southeast-2.elb.amazonaws.com/api/health" >> $GITHUB_STEP_SUMMARY
+          echo "- **App URL**: http://$ALB_DNS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Endpoint**: http://$ALB_DNS/api/health" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
