@@ -4,7 +4,7 @@ output "alb_dns_name" {
 }
 
 output "app_url" {
-  description = "Direct HTTP access URL to the AWS secondary application"
+  description = "Direct HTTP access URL to the AWS primary application"
   value       = "http://${module.alb.alb_dns_name}"
 }
 
@@ -41,4 +41,9 @@ output "cloudwatch_dashboard_name" {
 output "cost_budget_name" {
   description = "AWS FinOps Budget Name"
   value       = module.finops.budget_name
+}
+
+output "github_actions_role_arn" {
+  description = "OIDC IAM Role ARN for GitHub Actions deployments"
+  value       = module.iam.github_actions_role_arn
 }

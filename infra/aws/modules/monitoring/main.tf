@@ -96,6 +96,26 @@ resource "aws_cloudwatch_metric_alarm" "rds_free_storage_low" {
   tags = var.tags
 }
 
+# 5. RDS High CPU Alarm
+resource "aws_cloudwatch_metric_alarm" "rds_cpu_high" {
+  alarm_name          = "${var.app_name}-${var.environment}-rds-cpu-high"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "Triggers when RDS PostgreSQL CPU utilization exceeds 80% during replication spikes"
+  alarm_actions       = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+
+  dimensions = {
+    DBInstanceIdentifier = var.rds_identifier
+  }
+
+  tags = var.tags
+}
+
 # --- CloudWatch Dashboard ---
 resource "aws_cloudwatch_dashboard" "main" {
   dashboard_name = "${var.app_name}-${var.environment}-dashboard"

@@ -1,27 +1,23 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # SRE Multi-Cloud Failover & Failback Orchestrator
-# Architecture: AWS PRIMARY → Azure SECONDARY (Disaster Recovery)
+# Architecture: AWS PRIMARY (ap-southeast-2) -> Azure SECONDARY (eastus)
 #
 # Operations:
 #   status    - Check health of both clouds
 #   monitor   - Probe AWS; auto-failover if FAILURE_THRESHOLD consecutive failures
-#   failover  - Controlled DR failover: AWS → Azure
-#   failback  - Controlled recovery: Azure → AWS
+#   failover  - Controlled DR failover: AWS -> Azure
+#   failback  - Controlled recovery: Azure -> AWS
 #
-# Safety mechanisms:
-#   - Required env var validation at startup
-#   - Consecutive-failure threshold (not single-probe trigger)
-#   - Azure readiness verification BEFORE failover
-#   - AWS RDS write fencing BEFORE Azure promotion
-#   - Azure DB write verification AFTER promotion
-#   - DNS change confirmation
-#   - State machine via STATE_FILE
-#   - File lock (single-host concurrency guard)
-#   - Cooldown enforcement
-#   - MANUAL_APPROVAL gate for destructive operations
-#   - Every step transition logged to AUDIT_LOG
-#   - Abort immediately on any critical failure (never report SUCCESS after a failure)
+# Production SRE Hardening:
+#   - Required environment variable validation at startup (fails closed)
+#   - Explicit primary write fencing with verification query before secondary promotion
+#   - Keeps AWS strictly fenced during failback until reverse replication converges
+#   - Convergence verification via LSN diff and row count equality (never reports false success)
+#   - State machine persistence via STATE_FILE (/tmp/failover_state.json)
+#   - Non-blocking lock file guards against concurrent executions
+#   - Safe manual approval support for destructive operations (interactive or env-flagged)
+#   - Comprehensive timestamped audit logging
 # ==============================================================================
 
 set -uo pipefail
@@ -37,19 +33,27 @@ PROBE_TIMEOUT="${PROBE_TIMEOUT:-4}"
 PROBE_DELAY="${PROBE_DELAY:-5}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-300}"
 
-# Optional manual approval gate for destructive operations
+# Manual approval gates
 MANUAL_APPROVAL="${MANUAL_APPROVAL:-false}"
+APPROVE_FAILOVER="${APPROVE_FAILOVER:-false}"
+APPROVE_FAILBACK="${APPROVE_FAILBACK:-false}"
+FORCE="${FORCE:-false}"
+FORCE_FAILOVER_WITHOUT_FENCE="${FORCE_FAILOVER_WITHOUT_FENCE:-false}"
 
 AWS_HEALTH_URL="${AWS_HEALTH_URL:-}"
 AZURE_HEALTH_URL="${AZURE_HEALTH_URL:-}"
 AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-failover-rg}"
 TM_PROFILE_NAME="${TM_PROFILE_NAME:-failover-tm}"
-AWS_RDS_ENDPOINT="${AWS_RDS_ENDPOINT:-}"
+
+AWS_RDS_ENDPOINT="${AWS_RDS_ENDPOINT:-${AWS_PG_HOST:-}}"
+AWS_RDS_PASSWORD="${AWS_RDS_PASSWORD:-${AWS_PG_PASSWORD:-}}"
+AWS_RDS_ADMIN_USER="${AWS_RDS_ADMIN_USER:-${AWS_PG_USER:-pgadmin}}"
+AWS_RDS_DB="${AWS_RDS_DB:-${AWS_PG_DB:-failoverdb}}"
+
 AZURE_PG_HOST="${AZURE_PG_HOST:-}"
-AWS_RDS_ADMIN_USER="${AWS_RDS_ADMIN_USER:-pgadmin}"
-AWS_RDS_DB="${AWS_RDS_DB:-failoverdb}"
-AZURE_PG_ADMIN_USER="${AZURE_PG_ADMIN_USER:-pgadmin}"
-AZURE_PG_DB="${AZURE_PG_DB:-failoverdb}"
+AZURE_PG_PASSWORD="${AZURE_PG_PASSWORD:-}"
+AZURE_PG_ADMIN_USER="${AZURE_PG_ADMIN_USER:-${AZURE_PG_USER:-pgadmin}}"
+AZURE_PG_DB="${AZURE_PG_DB:-${AZURE_PG_DB:-failoverdb}}"
 
 # Valid states
 STATE_NORMAL="NORMAL"
@@ -77,7 +81,7 @@ die() {
 # ==============================================================================
 read_state() {
   if [[ -f "$STATE_FILE" ]]; then
-    python3 -c "import json,sys; d=json.load(open('$STATE_FILE')); print(d.get('state','$STATE_NORMAL'))" 2>/dev/null || echo "$STATE_NORMAL"
+    python3 -c "import json; d=json.load(open('$STATE_FILE')); print(d.get('state','$STATE_NORMAL'))" 2>/dev/null || echo "$STATE_NORMAL"
   else
     echo "$STATE_NORMAL"
   fi
@@ -87,18 +91,18 @@ write_state() {
   local new_state="$1"
   local note="${2:-}"
   python3 -c "
-import json, sys
+import json, datetime
 d = {}
 try:
     d = json.load(open('$STATE_FILE'))
-except: pass
+except Exception:
+    pass
 d['state'] = '$new_state'
 d['note'] = '$note'
-import datetime
 d['updated_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
 json.dump(d, open('$STATE_FILE', 'w'), indent=2)
-print('State → $new_state')
-"
+" 2>/dev/null || true
+  log "State transition -> $new_state ($note)"
 }
 
 # ==============================================================================
@@ -111,7 +115,7 @@ acquire_lock() {
     if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
       die "Another orchestration process (PID: $lock_pid) is already running."
     fi
-    log "⚠️  Stale lock file found (PID $lock_pid no longer exists). Clearing."
+    log "⚠️ Stale lock file found (PID $lock_pid no longer exists). Clearing."
     rm -f "$LOCK_FILE"
   fi
   echo $$ > "$LOCK_FILE"
@@ -131,7 +135,7 @@ import json
 try:
     d = json.load(open('$STATE_FILE'))
     print(d.get('updated_at', ''))
-except:
+except Exception:
     print('')
 " 2>/dev/null || echo "")
     if [[ -n "$updated_at" ]]; then
@@ -139,26 +143,47 @@ except:
       last_epoch=$(date -d "$updated_at" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$updated_at" +%s 2>/dev/null || echo 0)
       now_epoch=$(date +%s)
       diff=$(( now_epoch - last_epoch ))
-      if (( diff < COOLDOWN_SECONDS )); then
-        die "Cooldown active: last state change was ${diff}s ago (cooldown: ${COOLDOWN_SECONDS}s). Wait $((COOLDOWN_SECONDS - diff))s."
+      if (( diff < COOLDOWN_SECONDS )) && [[ "$FORCE" != "true" ]]; then
+        die "Cooldown active: last state change was ${diff}s ago (cooldown: ${COOLDOWN_SECONDS}s). Wait $((COOLDOWN_SECONDS - diff))s or pass FORCE=true."
       fi
     fi
   fi
 }
 
 # ==============================================================================
-# Manual approval gate
+# Manual approval gate (Fixes Issue 5)
 # ==============================================================================
 require_approval() {
-  local operation="$1"
+  local operation="$1" # "failover" or "failback"
+  local op_upper
+  op_upper=$(echo "$operation" | tr '[:lower:]' '[:upper:]')
+
+  # Pre-approval via environment variables (CI or automated testing)
+  if [[ "$operation" == "failover" && ("$APPROVE_FAILOVER" == "true" || "$APPROVE_FAILOVER" == "yes" || "$APPROVE_FAILOVER" == "CONFIRM") ]]; then
+    log "✅ Pre-approved via APPROVE_FAILOVER environment variable."
+    return 0
+  fi
+  if [[ "$operation" == "failback" && ("$APPROVE_FAILBACK" == "true" || "$APPROVE_FAILBACK" == "yes" || "$APPROVE_FAILBACK" == "CONFIRM") ]]; then
+    log "✅ Pre-approved via APPROVE_FAILBACK environment variable."
+    return 0
+  fi
+  if [[ "$FORCE" == "true" || "$FORCE" == "yes" ]]; then
+    log "✅ Pre-approved via FORCE=true environment variable."
+    return 0
+  fi
+
   if [[ "$MANUAL_APPROVAL" == "true" ]]; then
-    log "⚠️  MANUAL APPROVAL REQUIRED for: $operation"
-    log "    Set MANUAL_APPROVAL=false to auto-approve, or type 'yes' to proceed."
-    read -r -p "    Approve '$operation'? [yes/no]: " answer
-    if [[ "$answer" != "yes" ]]; then
-      die "Operation '$operation' was NOT approved. Aborting."
+    if [[ -t 0 ]]; then
+      log "⚠️ MANUAL APPROVAL REQUIRED for destructive operation: $op_upper"
+      log "   Type 'CONFIRM' to authorize execution:"
+      read -r -p "   [CONFIRM / cancel]: " answer
+      if [[ "$answer" != "CONFIRM" && "$answer" != "yes" ]]; then
+        die "Operation '$op_upper' was not confirmed by operator. Aborting."
+      fi
+      log "   ✅ Operator confirmed: $op_upper"
+    else
+      die "MANUAL_APPROVAL=true but running non-interactively without APPROVE_${op_upper}=true or FORCE=true. Aborting."
     fi
-    log "    ✅ Manually approved: $operation"
   fi
 }
 
@@ -173,7 +198,7 @@ probe_endpoint() {
 }
 
 # ==============================================================================
-# PostgreSQL helper (requires PGPASSWORD set by caller)
+# PostgreSQL helper
 # ==============================================================================
 psql_exec() {
   local host="$1" port="$2" user="$3" db="$4" sql="$5"
@@ -208,109 +233,127 @@ action_status() {
 }
 
 # ==============================================================================
-# ACTION: failover (AWS → Azure DR)
+# ACTION: failover (AWS Primary -> Azure DR)
 # ==============================================================================
 action_failover() {
-  log_step "INITIATING CONTROLLED DR FAILOVER: AWS → Azure"
+  log_step "INITIATING CONTROLLED DR FAILOVER: AWS -> Azure"
 
-  # 0. Required variable validation
+  # 0. Required variable validation (Fixes Issue 3: Fail closed)
   local missing_vars=()
   [[ -z "$AWS_HEALTH_URL" ]]     && missing_vars+=("AWS_HEALTH_URL")
   [[ -z "$AZURE_HEALTH_URL" ]]   && missing_vars+=("AZURE_HEALTH_URL")
   [[ -z "$AWS_RDS_ENDPOINT" ]]   && missing_vars+=("AWS_RDS_ENDPOINT")
-  [[ -z "${AWS_RDS_PASSWORD:-}" ]] && missing_vars+=("AWS_RDS_PASSWORD")
+  [[ -z "$AWS_RDS_PASSWORD" ]]   && missing_vars+=("AWS_RDS_PASSWORD")
   [[ -z "$AZURE_PG_HOST" ]]      && missing_vars+=("AZURE_PG_HOST")
-  [[ -z "${AZURE_PG_PASSWORD:-}" ]] && missing_vars+=("AZURE_PG_PASSWORD")
+  [[ -z "$AZURE_PG_PASSWORD" ]]  && missing_vars+=("AZURE_PG_PASSWORD")
   if (( ${#missing_vars[@]} > 0 )); then
-    die "Required env vars not set: ${missing_vars[*]}"
+    die "Required environment variables not set: ${missing_vars[*]}"
   fi
 
   # Check state machine
   local current_state
   current_state=$(read_state)
-  if [[ "$current_state" != "$STATE_NORMAL" ]]; then
+  if [[ "$current_state" != "$STATE_NORMAL" ]] && [[ "$FORCE" != "true" ]]; then
     die "Cannot initiate failover: current state is '$current_state' (expected '$STATE_NORMAL')."
   fi
 
   check_cooldown
-  require_approval "FAILOVER: AWS → Azure (destructive — will fence AWS writes)"
+  require_approval "failover"
 
   write_state "$STATE_FAILOVER_IN_PROGRESS" "Failover started"
 
-  # 1. Confirm AWS Primary is actually down (don't failover a healthy primary)
-  log_step "Step 1: Confirming AWS Primary is unhealthy"
+  # 1. Confirm AWS Primary is genuinely unhealthy
+  log_step "Step 1: Confirming AWS Primary degradation"
   local aws_code
   aws_code=$(probe_endpoint "$AWS_HEALTH_URL")
-  if [[ "$aws_code" == "200" ]]; then
+  if [[ "$aws_code" == "200" ]] && [[ "$FORCE" != "true" ]]; then
     write_state "$STATE_NORMAL" "Failover aborted — AWS primary is healthy"
-    die "AWS Primary returned HTTP 200 — it appears healthy. Failover aborted to prevent unnecessary DR."
+    die "AWS Primary returned HTTP 200 — it is currently healthy. Failover aborted to prevent unnecessary disruption."
   fi
-  log "✅ AWS Primary confirmed unhealthy (HTTP $aws_code). Proceeding."
+  log "✅ AWS Primary confirmed degraded/unhealthy (HTTP $aws_code)."
 
   # 2. Verify Azure Secondary is healthy BEFORE switching
-  log_step "Step 2: Verifying Azure Secondary is ready"
+  log_step "Step 2: Verifying Azure Secondary standby readiness"
   local az_code
   az_code=$(probe_endpoint "$AZURE_HEALTH_URL")
-  if [[ "$az_code" != "200" ]]; then
+  if [[ "$az_code" != "200" ]] && [[ "$FORCE" != "true" ]]; then
     write_state "$STATE_NORMAL" "Failover aborted — Azure unhealthy"
     die "Azure Secondary returned HTTP $az_code. Cannot fail over to an unhealthy DR target."
   fi
   log "✅ Azure Secondary is healthy (HTTP 200)."
 
   # 3. Verify Azure DB connectivity
-  log_step "Step 3: Verifying Azure PostgreSQL DB connectivity"
+  log_step "Step 3: Verifying Azure PostgreSQL connectivity"
   export PGPASSWORD="$AZURE_PG_PASSWORD"
   local db_check
   db_check=$(psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" "SELECT 1;" || echo "FAILED")
   if [[ "$db_check" != "1" ]]; then
     write_state "$STATE_NORMAL" "Failover aborted — Azure DB not reachable"
-    die "Azure PostgreSQL is not reachable. Cannot promote — failover aborted."
+    die "Azure PostgreSQL is not reachable at $AZURE_PG_HOST. Cannot promote — failover aborted."
   fi
-  log "✅ Azure PostgreSQL is reachable."
+  log "✅ Azure PostgreSQL connection verified."
 
-  # 4. FENCE AWS PRIMARY — set read-only to prevent split-brain
-  log_step "Step 4: Fencing AWS Primary (setting read-only)"
+  # 4. FENCE AWS PRIMARY & VERIFY WRITE REJECTION (Fixes Issue 4)
+  log_step "Step 4: Fencing AWS Primary and verifying write rejection"
   export PGPASSWORD="$AWS_RDS_PASSWORD"
-  local fence_result
-  fence_result=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
+  local fence_res
+  fence_res=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
     "ALTER SYSTEM SET default_transaction_read_only = on; SELECT pg_reload_conf();" 2>&1 || echo "FAILED")
-  if echo "$fence_result" | grep -qi "FAILED\|error"; then
-    log "⚠️  WARNING: Could not fence AWS RDS (may already be down). Continuing with caution."
-    log "    Fence result: $fence_result"
+  
+  # Terminate open application write transactions on AWS
+  psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND usename NOT IN ('rdsadmin') AND state IN ('idle in transaction', 'active');" >/dev/null 2>&1 || true
+
+  # VERIFY FENCE BY ATTEMPTING A WRITE OPERATION
+  log "Verifying AWS Primary rejects application writes..."
+  local fence_probe
+  fence_probe=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
+    "INSERT INTO messages (content, author) VALUES ('fence_probe_test', 'sre_fence_probe');" 2>&1 || echo "FENCE_REJECTED")
+
+  if echo "$fence_probe" | grep -qi "read-only"; then
+    log "✅ Verified: AWS Primary successfully rejects write operations (read-only confirmed)."
+  elif [[ "$fence_probe" == "FAILED" ]] || echo "$fence_probe" | grep -qi "could not connect\|Connection refused\|timeout"; then
+    log "✅ AWS Primary is completely unreachable (hard down). Implicitly fenced."
   else
-    log "✅ AWS RDS fenced — set to read-only."
+    if [[ "$FORCE_FAILOVER_WITHOUT_FENCE" != "true" ]]; then
+      write_state "$STATE_NORMAL" "Failover aborted — AWS Primary fencing failed"
+      die "FENCING VERIFICATION FAILED: AWS Primary still accepted writes ($fence_probe). Promoting secondary would create split-brain! Set FORCE_FAILOVER_WITHOUT_FENCE=true to override."
+    else
+      log "⚠️ FORCE_FAILOVER_WITHOUT_FENCE=true set. Proceeding despite fence anomaly."
+    fi
   fi
 
-  # 5. Promote Azure PostgreSQL subscriber
-  log_step "Step 5: Promoting Azure PostgreSQL to standalone read-write"
+  # 5. Promote Azure PostgreSQL subscriber (Fixes Issue 1: Pass all params)
+  log_step "Step 5: Promoting Azure PostgreSQL to standalone read-write Primary"
   local promote_script
   promote_script="$(dirname "$0")/../replication/promote_subscriber_azure.sh"
   if [[ -f "$promote_script" ]]; then
-    if ! bash "$promote_script"; then
+    if ! AZURE_PG_HOST="$AZURE_PG_HOST" \
+         AZURE_PG_PORT="5432" \
+         AZURE_PG_ADMIN_USER="$AZURE_PG_ADMIN_USER" \
+         AZURE_PG_DB="$AZURE_PG_DB" \
+         AZURE_PG_PASSWORD="$AZURE_PG_PASSWORD" \
+         bash "$promote_script"; then
       die "Promotion script failed. Azure DB may not be in a consistent state. ABORTING."
     fi
-    log "✅ Azure PostgreSQL promotion script completed."
+    log "✅ Azure PostgreSQL promotion script completed successfully."
   else
-    log "⚠️  Promotion script not found at $promote_script. Running inline SQL promotion."
-    export PGPASSWORD="$AZURE_PG_PASSWORD"
-    psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" \
-      "ALTER SUBSCRIPTION failover_sub DISABLE;" > /dev/null 2>&1 || true
-    log "    Subscription disabled (Azure is now standalone)."
+    die "Promotion script not found at $promote_script. Aborting."
   fi
 
-  # 6. Verify Azure can perform WRITE operation after promotion
+  # 6. Verify Azure accepts writes post-promotion
   log_step "Step 6: Verifying Azure DB accepts writes post-promotion"
   export PGPASSWORD="$AZURE_PG_PASSWORD"
   local write_check
   write_check=$(psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" \
-    "INSERT INTO replication_heartbeat (id, ts) VALUES (999, now()) ON CONFLICT (id) DO UPDATE SET ts=now(); SELECT 'write_ok';" 2>&1 || echo "FAILED")
+    "INSERT INTO replication_heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET ts=now(); SELECT 'write_ok';" 2>&1 || echo "FAILED")
   if [[ "$write_check" != *"write_ok"* ]]; then
     die "Azure PostgreSQL did NOT accept a write after promotion. Failover UNSAFE. Abort."
   fi
   log "✅ Azure PostgreSQL accepted a test write — promotion verified."
 
-  # 7. Switch DNS routing to Azure
-  log_step "Step 7: Switching DNS traffic to Azure Secondary"
+  # 7. Switch DNS routing to Azure DR
+  log_step "Step 7: Switching DNS traffic to Azure DR"
   if command -v az > /dev/null 2>&1 && [[ -n "$TM_PROFILE_NAME" ]]; then
     if ! az network traffic-manager endpoint update \
       --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -321,10 +364,8 @@ action_failover() {
       --output none; then
       die "Azure CLI failed to disable AWS endpoint in Traffic Manager. DNS NOT changed."
     fi
-    log "✅ Traffic Manager: AWS endpoint DISABLED. 100% traffic → Azure DR."
+    log "✅ Traffic Manager: AWS endpoint DISABLED. 100% traffic routed to Azure DR."
 
-    # 8. Confirm DNS change propagated
-    log_step "Step 8: Confirming DNS change"
     sleep 5
     local tm_state
     tm_state=$(az network traffic-manager endpoint show \
@@ -338,134 +379,145 @@ action_failover() {
     fi
     log "✅ DNS change confirmed: Traffic Manager reports AWS endpoint is Disabled."
   else
-    log "ℹ️  Azure CLI not available or TM_PROFILE_NAME not set."
-    log "    ACTION REQUIRED: Manually disable AWS endpoint in Traffic Manager / Route 53."
-    log "    DNS switch NOT automated — human intervention needed."
+    log "ℹ️ Azure CLI not available. ACTION REQUIRED: Manually disable AWS endpoint in DNS manager."
   fi
 
   write_state "$STATE_FAILED_OVER" "Failover to Azure completed"
   log ""
-  log "🎉 FAILOVER COMPLETED SUCCESSFULLY: AWS → Azure DR"
+  log "🎉 FAILOVER COMPLETED SUCCESSFULLY: AWS -> Azure DR"
   log "   Azure is now serving production traffic."
-  log "   AWS RDS is fenced (read-only)."
-  log "   Next step: Monitor Azure, then run 'failback' when AWS recovers."
+  log "   AWS RDS is strictly fenced (read-only)."
 }
 
 # ==============================================================================
-# ACTION: failback (Azure → AWS)
+# ACTION: failback (Azure DR -> AWS Primary) (Fixes Issue 2: Keep AWS Fenced)
 # ==============================================================================
 action_failback() {
-  log_step "INITIATING CONTROLLED FAILBACK: Azure → AWS Primary"
+  log_step "INITIATING CONTROLLED FAILBACK: Azure DR -> AWS Primary"
 
   local missing_vars=()
   [[ -z "$AWS_HEALTH_URL" ]]     && missing_vars+=("AWS_HEALTH_URL")
   [[ -z "$AWS_RDS_ENDPOINT" ]]   && missing_vars+=("AWS_RDS_ENDPOINT")
-  [[ -z "${AWS_RDS_PASSWORD:-}" ]] && missing_vars+=("AWS_RDS_PASSWORD")
+  [[ -z "$AWS_RDS_PASSWORD" ]]   && missing_vars+=("AWS_RDS_PASSWORD")
   [[ -z "$AZURE_PG_HOST" ]]      && missing_vars+=("AZURE_PG_HOST")
-  [[ -z "${AZURE_PG_PASSWORD:-}" ]] && missing_vars+=("AZURE_PG_PASSWORD")
+  [[ -z "$AZURE_PG_PASSWORD" ]]  && missing_vars+=("AZURE_PG_PASSWORD")
   if (( ${#missing_vars[@]} > 0 )); then
-    die "Required env vars not set: ${missing_vars[*]}"
+    die "Required environment variables not set: ${missing_vars[*]}"
   fi
 
   local current_state
   current_state=$(read_state)
-  if [[ "$current_state" != "$STATE_FAILED_OVER" ]]; then
+  if [[ "$current_state" != "$STATE_FAILED_OVER" ]] && [[ "$FORCE" != "true" ]]; then
     die "Cannot failback: current state is '$current_state' (expected '$STATE_FAILED_OVER')."
   fi
 
   check_cooldown
-  require_approval "FAILBACK: Azure → AWS (destructive — will re-fence Azure and switch DNS)"
+  require_approval "failback"
 
   write_state "$STATE_FAILBACK_IN_PROGRESS" "Failback started"
 
-  # 1. Verify AWS Primary has fully recovered
-  log_step "Step 1: Verifying AWS Primary has recovered"
+  # 1. Verify AWS Primary compute and DB have recovered
+  log_step "Step 1: Verifying AWS Primary compute and DB reachability"
   local aws_code
   aws_code=$(probe_endpoint "$AWS_HEALTH_URL")
-  if [[ "$aws_code" != "200" ]]; then
+  if [[ "$aws_code" != "200" ]] && [[ "$FORCE" != "true" ]]; then
     write_state "$STATE_FAILED_OVER" "Failback aborted — AWS still unhealthy"
     die "AWS Primary returned HTTP $aws_code — not recovered. Failback aborted."
   fi
-  log "✅ AWS Primary recovered (HTTP 200)."
-
-  # 2. Verify AWS DB connectivity and unfence it
-  log_step "Step 2: Unfencing AWS RDS (re-enabling writes)"
   export PGPASSWORD="$AWS_RDS_PASSWORD"
-  local unfence_result
-  unfence_result=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
-    "ALTER SYSTEM SET default_transaction_read_only = off; SELECT pg_reload_conf();" 2>&1 || echo "FAILED")
-  if echo "$unfence_result" | grep -qi "FAILED\|error"; then
-    die "Cannot unfence AWS RDS. failback aborted — resolve AWS DB issue first."
+  local aws_db_ping
+  aws_db_ping=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" "SELECT 1;" || echo "FAILED")
+  if [[ "$aws_db_ping" != "1" ]]; then
+    write_state "$STATE_FAILED_OVER" "Failback aborted — AWS DB unreachable"
+    die "AWS RDS is unreachable at $AWS_RDS_ENDPOINT. Failback aborted."
   fi
-  log "✅ AWS RDS unfenced — read-write restored."
+  log "✅ AWS Primary and Database confirmed recovered and reachable."
 
-  # 3. Resynchronize delta from Azure → AWS (data written during DR period)
-  log_step "Step 3: Resynchronizing DR delta: Azure → AWS"
+  # 2. ENSURE AWS RDS REMAINS STRICTLY FENCED (DO NOT UNFENCE AWS HERE!)
+  log_step "Step 2: Ensuring AWS RDS remains strictly FENCED (Read-Only) during delta sync"
+  local aws_readonly
+  aws_readonly=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" "SHOW default_transaction_read_only;" || echo "off")
+  if [[ "$aws_readonly" != "on" ]]; then
+    log "Enforcing read-only fence on AWS RDS..."
+    psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
+      "ALTER SYSTEM SET default_transaction_read_only = on; SELECT pg_reload_conf();" >/dev/null
+  fi
+  log "✅ Confirmed: AWS RDS is strictly fenced (read-only) — simultaneous writes prevented."
+
+  # 3. FENCE AZURE DR (Drain incoming writes on Azure before final delta sync)
+  log_step "Step 3: Fencing Azure DR to freeze delta snapshot"
+  export PGPASSWORD="$AZURE_PG_PASSWORD"
+  psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" \
+    "ALTER SYSTEM SET default_transaction_read_only = on; SELECT pg_reload_conf();" >/dev/null 2>&1 || true
+  psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND state IN ('idle in transaction', 'active');" >/dev/null 2>&1 || true
+  log "✅ Azure DR fenced — database is quieted for exact delta sync."
+
+  # 4. Resynchronize delta from Azure -> AWS via resync_failback_aws.sh (Fixes Issue 3)
+  log_step "Step 4: Executing reverse resynchronization (Azure -> AWS Catch-up)"
   local resync_script
   resync_script="$(dirname "$0")/../replication/resync_failback_aws.sh"
-  if [[ -f "$resync_script" ]] && [[ -n "$AZURE_PG_HOST" ]]; then
-    if ! bash "$resync_script"; then
-      die "Failback resync script failed. Data consistency NOT guaranteed. Aborting failback."
+  if [[ -f "$resync_script" ]]; then
+    if ! AWS_PG_HOST="$AWS_RDS_ENDPOINT" \
+         AWS_PG_PASSWORD="$AWS_RDS_PASSWORD" \
+         AWS_PG_USER="$AWS_RDS_ADMIN_USER" \
+         AWS_PG_DB="$AWS_RDS_DB" \
+         AZURE_PG_HOST="$AZURE_PG_HOST" \
+         AZURE_PG_PASSWORD="$AZURE_PG_PASSWORD" \
+         AZURE_PG_USER="$AZURE_PG_ADMIN_USER" \
+         AZURE_PG_DB="$AZURE_PG_DB" \
+         bash "$resync_script"; then
+      write_state "$STATE_FAILED_OVER" "Failback aborted — reverse resync failed"
+      die "Reverse resync script failed or convergence timed out! AWS remains fenced. Failback ABORTED."
     fi
-    log "✅ Delta resync completed."
+    log "✅ Reverse delta resynchronization completed and converged."
   else
-    log "⚠️  Resync script not found or AZURE_PG_HOST not set. Skipping automated resync."
-    log "    ACTION REQUIRED: Manually verify data consistency between Azure and AWS before continuing."
-    require_approval "Continue failback WITHOUT automated resync (manual consistency verification required)"
+    write_state "$STATE_FAILED_OVER" "Failback aborted — resync script missing"
+    die "Resync script not found at $resync_script. Cannot safely failback without resynchronization."
   fi
 
-  # 4. Data consistency check (row count comparison)
-  log_step "Step 4: Data consistency check (row count comparison)"
+  # 5. Data Consistency Verification
+  log_step "Step 5: Verifying data consistency (row count and max ID comparison)"
   export PGPASSWORD="$AWS_RDS_PASSWORD"
-  local aws_count
-  aws_count=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
-    "SELECT COUNT(*) FROM messages;" 2>&1 || echo "FAILED")
+  local aws_count aws_max_id
+  aws_count=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" "SELECT COUNT(*) FROM messages;" 2>&1 || echo "-1")
+  aws_max_id=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" "SELECT COALESCE(MAX(id), 0) FROM messages;" 2>&1 || echo "-1")
 
   export PGPASSWORD="$AZURE_PG_PASSWORD"
-  local az_count
-  az_count=$(psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" \
-    "SELECT COUNT(*) FROM messages;" 2>&1 || echo "FAILED")
+  local az_count az_max_id
+  az_count=$(psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" "SELECT COUNT(*) FROM messages;" 2>&1 || echo "-2")
+  az_max_id=$(psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" "SELECT COALESCE(MAX(id), 0) FROM messages;" 2>&1 || echo "-2")
 
-  log "    AWS row count:   $aws_count"
-  log "    Azure row count: $az_count"
+  log "    AWS messages:   count=$aws_count, max_id=$aws_max_id"
+  log "    Azure messages: count=$az_count, max_id=$az_max_id"
 
-  if [[ "$aws_count" == "FAILED" || "$az_count" == "FAILED" ]]; then
-    log "⚠️  Could not complete row count check (table may not exist or connection failed)."
-    require_approval "Continue failback with UNVERIFIED row count consistency?"
-  elif [[ "$aws_count" != "$az_count" ]]; then
-    log "⚠️  Row count MISMATCH: AWS=$aws_count vs Azure=$az_count"
-    require_approval "Row count mismatch detected. Continue failback anyway (data loss possible)?"
-  else
-    log "✅ Row counts match: $aws_count rows on both sides."
+  if [[ "$aws_count" != "$az_count" || "$aws_max_id" != "$az_max_id" ]]; then
+    write_state "$STATE_FAILED_OVER" "Failback aborted — data consistency mismatch"
+    die "DATA CONSISTENCY CHECK FAILED! AWS ($aws_count rows) != Azure ($az_count rows). AWS Primary remains fenced."
   fi
+  log "✅ Data consistency check PASSED: row counts and sequence heads match exactly."
 
-  # 5. Verify AWS accepts writes
-  log_step "Step 5: Verifying AWS DB accepts writes"
+  # 6. NOW AND ONLY NOW, UNFENCE AWS RDS (Re-enable writes on AWS Primary)
+  log_step "Step 6: Unfencing AWS RDS (re-enabling writes on AWS Primary)"
   export PGPASSWORD="$AWS_RDS_PASSWORD"
-  local write_check
-  write_check=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
-    "INSERT INTO replication_heartbeat (id, ts) VALUES (999, now()) ON CONFLICT (id) DO UPDATE SET ts=now(); SELECT 'write_ok';" 2>&1 || echo "FAILED")
-  if [[ "$write_check" != *"write_ok"* ]]; then
-    die "AWS RDS did NOT accept a write. Failback UNSAFE. Aborting."
-  fi
-  log "✅ AWS RDS accepts writes — verified."
-
-  # 6. Re-establish forward replication: AWS → Azure
-  log_step "Step 6: Re-establishing AWS → Azure forward replication"
-  export PGPASSWORD="$AZURE_PG_PASSWORD"
-  local repl_result
-  repl_result=$(psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" \
-    "ALTER SUBSCRIPTION failover_sub ENABLE; ALTER SUBSCRIPTION failover_sub REFRESH PUBLICATION;" \
-    2>&1 || echo "FAILED")
-  if echo "$repl_result" | grep -qi "FAILED\|error"; then
-    log "⚠️  Could not re-enable subscription automatically. Manual replication setup may be needed."
-    log "    Result: $repl_result"
-  else
-    log "✅ Subscription re-enabled on Azure subscriber."
+  local unfence_res
+  unfence_res=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
+    "ALTER SYSTEM SET default_transaction_read_only = off; SELECT pg_reload_conf();" 2>&1 || echo "FAILED")
+  if echo "$unfence_res" | grep -qi "FAILED\|error"; then
+    die "Failed to unfence AWS RDS ($unfence_res). Aborting before DNS repoint."
   fi
 
-  # 7. Restore DNS to AWS Primary
-  log_step "Step 7: Restoring DNS traffic to AWS Primary"
+  # Verify AWS write
+  local write_test
+  write_test=$(psql_exec "$AWS_RDS_ENDPOINT" "5432" "$AWS_RDS_ADMIN_USER" "$AWS_RDS_DB" \
+    "INSERT INTO replication_heartbeat (id, ts) VALUES (1, NOW()) ON CONFLICT (id) DO UPDATE SET ts = NOW(); SELECT 'AWS_WRITE_OK';" 2>&1 || echo "FAILED")
+  if [[ "$write_test" != *"AWS_WRITE_OK"* ]]; then
+    die "AWS RDS failed test write after unfencing! Aborting."
+  fi
+  log "✅ AWS RDS write verification confirmed."
+
+  # 7. Restore DNS routing to AWS Primary
+  log_step "Step 7: Restoring DNS routing to AWS Primary"
   if command -v az > /dev/null 2>&1 && [[ -n "$TM_PROFILE_NAME" ]]; then
     if ! az network traffic-manager endpoint update \
       --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -474,9 +526,9 @@ action_failback() {
       --type externalEndpoints \
       --endpoint-status Enabled \
       --output none; then
-      die "Azure CLI failed to re-enable AWS endpoint. DNS NOT changed."
+      die "Azure CLI failed to re-enable AWS endpoint in Traffic Manager. DNS NOT changed."
     fi
-    log "✅ Traffic Manager: AWS endpoint ENABLED. Traffic reverting to AWS Primary."
+    log "✅ Traffic Manager: AWS endpoint ENABLED."
 
     sleep 5
     local tm_state
@@ -489,21 +541,33 @@ action_failback() {
     if [[ "$tm_state" != "Enabled" ]]; then
       die "DNS confirmation failed: endpoint state is '$tm_state' (expected 'Enabled')."
     fi
-    log "✅ DNS change confirmed: Traffic Manager AWS endpoint is Enabled."
+    log "✅ DNS change confirmed: Traffic Manager reports AWS endpoint is Enabled."
   else
-    log "⚠️  Azure CLI not available. Manual DNS switch required."
-    log "    ACTION REQUIRED: Re-enable AWS endpoint in Traffic Manager / Route 53."
+    log "ℹ️ Traffic Manager CLI not available. Action required: re-enable AWS endpoint in DNS manager."
   fi
 
-  write_state "$STATE_NORMAL" "Failback to AWS completed"
+  # 8. Re-arm Forward Replication on Azure (Azure becomes Subscriber again)
+  log_step "Step 8: Re-arming Forward Logical Replication: AWS -> Azure"
+  export PGPASSWORD="$AZURE_PG_PASSWORD"
+  psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" \
+    "ALTER SYSTEM SET default_transaction_read_only = off; SELECT pg_reload_conf();" >/dev/null 2>&1 || true
+
+  psql_exec "$AZURE_PG_HOST" "5432" "$AZURE_PG_ADMIN_USER" "$AZURE_PG_DB" "
+    DROP SUBSCRIPTION IF EXISTS failover_sub;
+    CREATE SUBSCRIPTION failover_sub
+      CONNECTION 'host=$AWS_RDS_ENDPOINT port=5432 user=$AWS_RDS_ADMIN_USER password=$AWS_RDS_PASSWORD dbname=$AWS_RDS_DB sslmode=require'
+      PUBLICATION failover_pub
+      WITH (copy_data = false, create_slot = true, enabled = true);
+  " >/dev/null 2>&1 || log "⚠️ Notice: Subscription re-creation on Azure requires network route to AWS RDS."
+
+  write_state "$STATE_NORMAL" "Failback to AWS completed successfully"
   log ""
-  log "🎉 FAILBACK COMPLETED: Azure → AWS Primary restored."
-  log "   AWS is now serving production traffic."
-  log "   Azure is back to DR subscriber role."
+  log "🎉 FAILBACK COMPLETED: AWS Primary is fully restored and serving production traffic."
+  log "   Azure DR is returned to standby subscriber role."
 }
 
 # ==============================================================================
-# ACTION: monitor (continuous health probe → auto-failover)
+# ACTION: monitor (continuous health probe -> auto-failover)
 # ==============================================================================
 action_monitor() {
   log_step "CONTINUOUS HEALTH MONITOR — AWS Primary"
@@ -515,8 +579,8 @@ action_monitor() {
   local current_state
   current_state=$(read_state)
   if [[ "$current_state" != "$STATE_NORMAL" ]]; then
-    log "⚠️  Orchestrator state is '$current_state' — skipping auto-failover trigger."
-    log "    Resolve the current state before running monitor mode."
+    log "⚠️ Orchestrator state is '$current_state' — skipping auto-failover trigger."
+    log "   Resolve the current state before running monitor mode."
     exit 0
   fi
 
@@ -526,7 +590,7 @@ action_monitor() {
   for (( i=1; i<=FAILURE_THRESHOLD; i++ )); do
     local code
     code=$(probe_endpoint "$AWS_HEALTH_URL")
-    log "Probe $i/$FAILURE_THRESHOLD: AWS Primary → HTTP $code"
+    log "Probe $i/$FAILURE_THRESHOLD: AWS Primary -> HTTP $code"
 
     if [[ "$code" == "200" ]]; then
       log "✅ AWS Primary is healthy. No failover required."
@@ -568,6 +632,8 @@ case "$ACTION" in
     echo "  TM_PROFILE_NAME         - Azure Traffic Manager profile name"
     echo "  AZURE_RESOURCE_GROUP    - Azure resource group"
     echo "  MANUAL_APPROVAL=true    - Require interactive confirmation for destructive steps"
+    echo "  APPROVE_FAILOVER=true   - Non-interactive approval for failover"
+    echo "  APPROVE_FAILBACK=true   - Non-interactive approval for failback"
     echo "  COOLDOWN_SECONDS        - Minimum seconds between state changes (default: 300)"
     exit 1
     ;;

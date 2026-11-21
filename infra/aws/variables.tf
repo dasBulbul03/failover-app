@@ -106,6 +106,12 @@ variable "alarm_email" {
   default     = ""
 }
 
+variable "github_repository" {
+  description = "GitHub repository for OIDC trust (e.g. 'dasBulbul03/failover-app'). Set empty to skip."
+  type        = string
+  default     = "dasBulbul03/failover-app"
+}
+
 variable "tags" {
   description = "Resource tags"
   type        = map(string)

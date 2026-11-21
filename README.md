@@ -264,19 +264,24 @@ When primary AWS degradation occurs, the failover workflow executes:
 
 To prevent data loss and split-brain when AWS recovers, traffic is **never** blindly switched back to AWS without delta resynchronization.
 
-### 7.1 Resynchronization Sequence
-1. **Health Verification**: Confirm AWS ECS and Amazon RDS PostgreSQL are healthy for at least 5 minutes.
-2. **Delta Capture**: Data written to Azure during the failover window must be migrated back to AWS:
+### 7.1 Hardened Failback Sequence (Split-Brain Prevention)
+To prevent data loss and split-brain when AWS recovers, traffic is **never** blindly switched back to AWS:
+1. **Health Verification**: Confirm AWS ECS and Amazon RDS PostgreSQL are online and healthy.
+2. **Keep AWS Fenced**: AWS RDS remains strictly read-only (`default_transaction_read_only = on`) to prevent simultaneous application writes.
+3. **Fence Azure DR**: Azure PostgreSQL is transitioned to read-only to freeze the failover delta snapshot and terminate active transactions.
+4. **Reverse Resynchronization & Convergence**:
    ```bash
-   # Run automated resynchronization script
    bash scripts/replication/resync_failback_aws.sh
    ```
-   - Creates temporary publication `failback_pub` on Azure PostgreSQL.
-   - Creates temporary subscription `failback_sub` on AWS RDS.
-   - Waits for pending lag to reach 0 bytes.
-3. **Sequence Advancement**: AWS PostgreSQL sequence is advanced to the maximum `id` generated on Azure.
-4. **DNS Restoration**: Global DNS re-enables `aws-primary` as Priority 1.
-5. **Re-establish Forward Replication**: AWS RDS recreates publication `failover_pub`, and Azure attaches subscription `failover_sub`.
+   - Creates temporary reverse publication `failback_pub` on Azure PostgreSQL.
+   - Creates temporary catch-up subscription `failback_sub` on AWS RDS.
+   - Polls for true convergence: verifies both LSN delta catch-up (`pg_wal_lsn_diff >= 0`) and table row count equality (`AWS rows >= Azure rows`).
+   - Fails closed if convergence does not complete within timeout.
+5. **Sequence Synchronization**: Primary key auto-increment sequences (`setval`) are aligned with Azure's highest assigned ID.
+6. **Data Consistency Audit**: Verifies row counts and sequence heads match across both clouds before proceeding.
+7. **Unfence AWS RDS**: AWS Primary is switched back to read-write mode, and a test write verifies database readiness.
+8. **DNS Traffic Restoration**: Global DNS re-enables `aws-primary` as Priority 1.
+9. **Re-establish Forward Replication**: AWS RDS creates forward publication `failover_pub`, and Azure attaches subscription `failover_sub`.
 
 ---
 

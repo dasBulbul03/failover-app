@@ -106,6 +106,15 @@ variable "environment_variables" {
   default     = []
 }
 
+variable "secrets" {
+  type = list(object({
+    name      = string
+    valueFrom = string
+  }))
+  description = "Secrets injected into container from AWS Secrets Manager or SSM Parameter Store"
+  default     = []
+}
+
 variable "tags" {
   type        = map(string)
   description = "Resource tags"

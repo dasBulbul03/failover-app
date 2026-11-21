@@ -51,13 +51,14 @@ module "networking" {
   tags               = local.common_tags
 }
 
-# 2. IAM Roles (Least-Privilege Execution & Runtime Roles)
+# 2. IAM Roles (Least-Privilege Execution, Runtime & GitHub OIDC Deploy Roles)
 module "iam" {
   source = "./modules/iam"
 
-  app_name    = var.app_name
-  environment = var.environment
-  tags        = local.common_tags
+  app_name          = var.app_name
+  environment       = var.environment
+  github_repository = var.github_repository
+  tags              = local.common_tags
 }
 
 # 3. Container Registry (ECR with Lifecycle Cleanup & Scan on Push)

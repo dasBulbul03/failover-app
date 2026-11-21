@@ -13,6 +13,10 @@ on:
           - auto-monitor
           - failover-to-azure
           - failback-to-aws
+      approval:
+        description: 'Type "CONFIRM" to authorize destructive failover or failback'
+        required: false
+        default: ''
       reason:
         description: 'Reason for action / drill notes'
         required: false
@@ -41,6 +45,9 @@ jobs:
           AWS_RDS_PASSWORD: ${{ secrets.AWS_RDS_PASSWORD }}
           AZURE_PG_HOST: ${{ secrets.AZURE_PG_HOST }}
           AZURE_PG_PASSWORD: ${{ secrets.AZURE_PG_PASSWORD }}
+          MANUAL_APPROVAL: "true"
+          APPROVE_FAILOVER: ${{ github.event.inputs.approval == 'CONFIRM' }}
+          APPROVE_FAILBACK: ${{ github.event.inputs.approval == 'CONFIRM' }}
           ACTION: ${{ github.event.inputs.action }}
         run: |
           case "$ACTION" in
@@ -68,6 +75,7 @@ jobs:
           echo "- **Primary Cloud**: AWS (\`ap-southeast-2\`)" >> $GITHUB_STEP_SUMMARY
           echo "- **Secondary Cloud**: Azure (\`eastus\`)" >> $GITHUB_STEP_SUMMARY
           echo "- **Action**: \`${{ github.event.inputs.action }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Approval Received**: \`${{ github.event.inputs.approval == 'CONFIRM' && 'YES (CONFIRMED)' || 'NO' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Reason**: ${{ github.event.inputs.reason }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Triggered By**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Timestamp**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_STEP_SUMMARY

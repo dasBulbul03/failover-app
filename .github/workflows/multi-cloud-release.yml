@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Deployment target'
+        description: 'Deployment target cloud'
         required: true
         type: choice
         default: 'both'
         options:
           - both
-          - azure-only
-          - aws-only
+          - aws-primary
+          - azure-secondary
 
 permissions:
   id-token: write
@@ -30,69 +30,11 @@ jobs:
       - run: npm ci
       - run: npm test
 
-  deploy-azure:
-    name: Deploy to Azure (Primary)
-    runs-on: ubuntu-latest
-    needs: test
-    if: inputs.target == 'both' || inputs.target == 'azure-only'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Azure Container Registry
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build and Push Docker image
-        run: |
-          IMAGE_URI="${{ secrets.ACR_LOGIN_SERVER }}/failover-app"
-          docker build --platform linux/amd64 -t "$IMAGE_URI:${{ github.sha }}" -t "$IMAGE_URI:latest" .
-          docker push "$IMAGE_URI:${{ github.sha }}"
-          docker push "$IMAGE_URI:latest"
-
-      - name: Azure Login
-        uses: azure/login@v1
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
-          images: ${{ secrets.ACR_LOGIN_SERVER }}/failover-app:${{ github.sha }}
-
-      - name: Verify Azure Health
-        run: |
-          URL="https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health?probe=readiness"
-          echo "Checking health at: $URL"
-          HEALTHY=false
-          for i in {1..12}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
-            if [ "$STATUS" = "200" ]; then
-              echo "✅ Azure is healthy!"
-              HEALTHY=true
-              break
-            fi
-            sleep 10
-          done
-          if [ "$HEALTHY" != "true" ]; then
-            echo "❌ Azure health check failed!"
-            exit 1
-          fi
-
   deploy-aws:
-    name: Deploy to AWS (Secondary)
+    name: Deploy to AWS (Primary Cloud)
     runs-on: ubuntu-latest
     needs: test
-    if: inputs.target == 'both' || inputs.target == 'aws-only'
+    if: inputs.target == 'both' || inputs.target == 'aws-primary'
     env:
       AWS_REGION: ap-southeast-2
       ECR_REPOSITORY: failover-app
@@ -101,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC / IAM Role)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -116,23 +58,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build, tag, and push image to ECR
+      - name: Build and Push Immutable Image to ECR
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: sha-${{ github.sha }}
         run: |
           docker build --platform linux/amd64 \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest || echo "Notice: ECR repository tag mutability is IMMUTABLE; latest tag overwrite skipped."
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Update ECS Service
+      - name: Update ECS Task Definition & Deploy
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image_uri }}
         run: |
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --force-new-deployment \
-            --region $AWS_REGION
+          SERVICE_STATUS=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION" --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            CURRENT_TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION" --query "services[0].taskDefinition" --output text)
+            aws ecs describe-task-definition --task-definition "$CURRENT_TASK_DEF_ARN" --region "$AWS_REGION" --query "taskDefinition" > task-def.json
+            jq --arg IMAGE "$IMAGE_URI" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' task-def.json > new-task-def.json
+            NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --region "$AWS_REGION" --query "taskDefinition.taskDefinitionArn" --output text)
+            aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_TASK_DEF_ARN" --region "$AWS_REGION"
+            echo "✅ ECS service updated with new task revision $NEW_TASK_DEF_ARN"
+          else
+            aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --force-new-deployment --region "$AWS_REGION" 2>/dev/null || echo "ECS service deployment skipped."
+          fi
 
       - name: Verify AWS Health
         run: |
@@ -146,29 +99,92 @@ jobs:
           for i in {1..12}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
             if [ "$STATUS" = "200" ]; then
-              echo "✅ AWS is healthy!"
+              echo "✅ AWS Primary is healthy!"
               HEALTHY=true
               break
             fi
             sleep 10
           done
           if [ "$HEALTHY" != "true" ]; then
-            echo "❌ AWS health check failed!"
+            echo "❌ AWS Primary health check failed!"
+            exit 1
+          fi
+
+  deploy-azure:
+    name: Deploy to Azure (Secondary / DR Cloud)
+    runs-on: ubuntu-latest
+    needs: [test, deploy-aws]
+    if: always() && (inputs.target == 'both' || inputs.target == 'azure-secondary') && (needs.deploy-aws.result == 'success' || needs.deploy-aws.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        if: "${{ secrets.ACR_LOGIN_SERVER != '' }}"
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and Push Docker image
+        if: "${{ secrets.ACR_LOGIN_SERVER != '' }}"
+        run: |
+          IMAGE_URI="${{ secrets.ACR_LOGIN_SERVER }}/failover-app"
+          docker build --platform linux/amd64 -t "$IMAGE_URI:${{ github.sha }}" -t "$IMAGE_URI:latest" .
+          docker push "$IMAGE_URI:${{ github.sha }}"
+          docker push "$IMAGE_URI:latest"
+
+      - name: Azure Login
+        if: "${{ secrets.AZURE_CREDENTIALS != '' || secrets.AZURE_CLIENT_ID != '' }}"
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Web App
+        if: "${{ secrets.AZURE_WEBAPP_NAME != '' }}"
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ secrets.AZURE_WEBAPP_NAME }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/failover-app:${{ github.sha }}
+
+      - name: Verify Azure Health
+        if: "${{ secrets.AZURE_WEBAPP_NAME != '' }}"
+        run: |
+          URL="https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health?probe=readiness"
+          echo "Checking health at: $URL"
+          HEALTHY=false
+          for i in {1..12}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Azure Secondary (DR) is healthy!"
+              HEALTHY=true
+              break
+            fi
+            sleep 10
+          done
+          if [ "$HEALTHY" != "true" ]; then
+            echo "❌ Azure Secondary health check failed!"
             exit 1
           fi
 
   release-summary:
     name: Multi-Cloud Release Summary
     runs-on: ubuntu-latest
-    needs: [deploy-azure, deploy-aws]
+    needs: [deploy-aws, deploy-azure]
     if: always()
     steps:
       - name: Post Summary
         run: |
           echo "## 🌐 Multi-Cloud Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Cloud | Status | Endpoint |" >> $GITHUB_STEP_SUMMARY
-          echo "| :--- | :---: | :--- |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Azure (Primary)** | ${{ needs.deploy-azure.result }} | https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net |" >> $GITHUB_STEP_SUMMARY
-          echo "| **AWS (Secondary)** | ${{ needs.deploy-aws.result }} | http://${{ secrets.AWS_ALB_DNS || 'AWS ALB' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cloud | Role | Status | Endpoint |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :---: | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **AWS** | Primary Cloud | ${{ needs.deploy-aws.result }} | http://${{ secrets.AWS_ALB_DNS || 'failover-alb-97690356.ap-southeast-2.elb.amazonaws.com' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Azure** | Secondary (DR) | ${{ needs.deploy-azure.result }} | https://${{ secrets.AZURE_WEBAPP_NAME || 'failover-app' }}.azurewebsites.net |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Commit**: \`${{ github.sha }}\` | **Triggered by**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
