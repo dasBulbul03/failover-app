@@ -59,7 +59,7 @@ variable "tags" {
   default = {
     Project     = "failover-app"
     Environment = "prod"
-    Role        = "PrimaryCloud"
+    Role        = "DisasterRecovery-Secondary"
     ManagedBy   = "Terraform"
   }
 }

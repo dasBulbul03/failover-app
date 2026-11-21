@@ -1,241 +1,118 @@
-# DNS Failover Setup Guide
+# Multi-Cloud DNS Failover Setup Guide
+## Architecture: AWS (Primary) → Azure (Secondary Disaster Recovery)
 
-This guide covers two approaches to configure DNS-based failover between Azure (primary) and AWS (secondary) for the failover-app.
+This guide covers configuring DNS-based active-passive failover with **Amazon Web Services as PRIMARY** and **Microsoft Azure as SECONDARY (Disaster Recovery)**.
 
 ---
 
 ## Overview
 
 ```
-User → DNS (Traffic Manager / Route 53)
-         ├─ PRIMARY  → Azure App Service  (priority 1)
-         └─ SECONDARY → AWS App Runner   (priority 2, activated on primary failure)
+User / Client Traffic
+         │
+         ▼
+Global DNS Router (Azure Traffic Manager / AWS Route 53)
+         ├─ PRIMARY (Priority 1)   → AWS Application Load Balancer (Sydney ap-southeast-2)
+         └─ SECONDARY (Priority 2) → Azure App Service (East US - Activated on AWS failure)
 ```
 
-Health probe endpoint: `GET /api/health` → expected HTTP 200
+Health Probe: `GET /api/health?probe=readiness` → Expected HTTP 200
 
 ---
 
-## Method 1: Azure Traffic Manager (Recommended)
+## Method 1: Azure Traffic Manager (Priority Routing)
 
-Azure Traffic Manager uses **Priority routing** — all traffic goes to the primary endpoint; the secondary only receives traffic when the primary health check fails.
-
-### Prerequisites
-- Azure CLI installed and logged in (`az login`)
-- Both Azure Web App and AWS App Runner deployed
-- Your domain's DNS managed or delegatable to Traffic Manager CNAME
-
-### Step-by-step with Azure CLI
+### Step-by-Step CLI Configuration
 
 ```bash
 RESOURCE_GROUP="failover-rg"
 PROFILE_NAME="failover-tm"
-AZURE_APP_FQDN="<your-azure-webapp>.azurewebsites.net"   # from Bicep output: webAppUrl
-AWS_APP_FQDN="<your-apprunner-id>.awsapprunner.com"      # from Terraform output: app_runner_url
+AWS_ALB_FQDN="failover-alb-97690356.ap-southeast-2.elb.amazonaws.com"
+AZURE_APP_FQDN="<your-app-name>.azurewebsites.net"
 
-# 1. Create Traffic Manager profile (priority routing, TTL 60s)
+# 1. Create Traffic Manager Profile (Priority Routing, 60s TTL)
 az network traffic-manager profile create \
   --name "$PROFILE_NAME" \
   --resource-group "$RESOURCE_GROUP" \
   --routing-method Priority \
-  --unique-dns-name failover-app \
+  --unique-dns-name "failover-app-global" \
   --ttl 60 \
-  --protocol HTTPS \
-  --port 443 \
-  --path /api/health
+  --protocol HTTP \
+  --port 80 \
+  --path "/api/health?probe=readiness"
 
-# 2. Add Azure App Service as PRIMARY endpoint (priority 1)
+# 2. Add AWS Application Load Balancer as PRIMARY (Priority 1)
 az network traffic-manager endpoint create \
-  --name azure-primary \
+  --name aws-primary \
+  --profile-name "$PROFILE_NAME" \
+  --resource-group "$RESOURCE_GROUP" \
+  --type externalEndpoints \
+  --target "$AWS_ALB_FQDN" \
+  --priority 1 \
+  --endpoint-status Enabled
+
+# 3. Add Azure App Service as SECONDARY / STANDBY (Priority 2)
+az network traffic-manager endpoint create \
+  --name azure-secondary \
   --profile-name "$PROFILE_NAME" \
   --resource-group "$RESOURCE_GROUP" \
   --type externalEndpoints \
   --target "$AZURE_APP_FQDN" \
-  --priority 1 \
-  --endpoint-status Enabled
-
-# 3. Add AWS App Runner as SECONDARY endpoint (priority 2)
-az network traffic-manager endpoint create \
-  --name aws-secondary \
-  --profile-name "$PROFILE_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --type externalEndpoints \
-  --target "$AWS_APP_FQDN" \
   --priority 2 \
   --endpoint-status Enabled
-
-# 4. View the Traffic Manager FQDN (point your domain's CNAME here)
-az network traffic-manager profile show \
-  --name "$PROFILE_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --query "dnsConfig.fqdn" \
-  --output tsv
-```
-
-### DNS Configuration
-
-After running the commands above, create a **CNAME** record in your DNS registrar:
-
-| Record | Type  | Value                                    | TTL |
-|--------|-------|------------------------------------------|-----|
-| `@` or `www` | CNAME | `failover-app.trafficmanager.net` | 60s |
-
-### Health Probe Settings
-
-Traffic Manager is configured with:
-- **Protocol**: HTTPS
-- **Port**: 443
-- **Path**: `/api/health`
-- **Probe interval**: 30 seconds (default)
-- **Tolerated failures**: 3 (default — failover triggers after ~90s)
-
-To adjust the probe interval to 10 seconds (faster failover, requires Standard tier):
-```bash
-az network traffic-manager profile update \
-  --name "$PROFILE_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --monitor-interval 10 \
-  --monitor-timeout 5 \
-  --monitor-tolerated-failures 2
-```
-
-### Verify & Monitor
-
-```bash
-# Check endpoint health status
-az network traffic-manager endpoint show \
-  --name azure-primary \
-  --profile-name "$PROFILE_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --type externalEndpoints \
-  --query "properties.endpointMonitorStatus"
-
-# List all endpoints and their status
-az network traffic-manager endpoint list \
-  --profile-name "$PROFILE_NAME" \
-  --resource-group "$RESOURCE_GROUP" \
-  --output table
 ```
 
 ---
 
-## Method 2: AWS Route 53 Failover Routing
+## Method 2: AWS Route 53 (Failover Routing Policy)
 
-Route 53 **Failover routing policy** sends traffic to the PRIMARY record; if its health check fails, traffic automatically shifts to the SECONDARY record.
+If using AWS Route 53 as the authoritative DNS manager:
 
-### Prerequisites
-- AWS CLI installed and configured (`aws configure`)
-- Your domain hosted in Route 53 (or delegated to it)
-- Hosted Zone ID for your domain
-
-### Step-by-step with AWS CLI
+### Step 1: Create Route 53 Health Checks
 
 ```bash
-HOSTED_ZONE_ID="Z1234567890ABC"              # Your Route 53 Hosted Zone ID
-DOMAIN="app.yourdomain.com"
-AZURE_APP_FQDN="<your-azure-webapp>.azurewebsites.net"
-AWS_APP_FQDN="<your-apprunner-id>.awsapprunner.com"
-
-# 1. Create a health check for the Azure (primary) endpoint
-HEALTH_CHECK_ID=$(aws route53 create-health-check \
-  --caller-reference "azure-primary-$(date +%s)" \
+# 1. Health check for AWS Primary ALB
+aws route53 create-health-check \
+  --caller-reference "aws-primary-$(date +%s)" \
   --health-check-config '{
-    "FullyQualifiedDomainName": "'"$AZURE_APP_FQDN"'",
-    "Port": 443,
+    "Type": "HTTP",
+    "FullyQualifiedDomainName": "failover-alb-97690356.ap-southeast-2.elb.amazonaws.com",
+    "Port": 80,
+    "ResourcePath": "/api/health?probe=readiness",
+    "RequestInterval": 10,
+    "FailureThreshold": 3
+  }'
+
+# 2. Health check for Azure Secondary Web App
+aws route53 create-health-check \
+  --caller-reference "azure-secondary-$(date +%s)" \
+  --health-check-config '{
     "Type": "HTTPS",
-    "ResourcePath": "/api/health",
+    "FullyQualifiedDomainName": "<your-app>.azurewebsites.net",
+    "Port": 443,
+    "ResourcePath": "/api/health?probe=readiness",
     "RequestInterval": 30,
     "FailureThreshold": 3
-  }' \
-  --query "HealthCheck.Id" \
-  --output text)
-
-echo "Health Check ID: $HEALTH_CHECK_ID"
-
-# 2. Create PRIMARY failover CNAME record → Azure App Service
-aws route53 change-resource-record-sets \
-  --hosted-zone-id "$HOSTED_ZONE_ID" \
-  --change-batch '{
-    "Changes": [
-      {
-        "Action": "UPSERT",
-        "ResourceRecordSet": {
-          "Name": "'"$DOMAIN"'",
-          "Type": "CNAME",
-          "SetIdentifier": "azure-primary",
-          "Failover": "PRIMARY",
-          "TTL": 60,
-          "ResourceRecords": [{"Value": "'"$AZURE_APP_FQDN"'"}],
-          "HealthCheckId": "'"$HEALTH_CHECK_ID"'"
-        }
-      }
-    ]
-  }'
-
-# 3. Create SECONDARY failover CNAME record → AWS App Runner
-aws route53 change-resource-record-sets \
-  --hosted-zone-id "$HOSTED_ZONE_ID" \
-  --change-batch '{
-    "Changes": [
-      {
-        "Action": "UPSERT",
-        "ResourceRecordSet": {
-          "Name": "'"$DOMAIN"'",
-          "Type": "CNAME",
-          "SetIdentifier": "aws-secondary",
-          "Failover": "SECONDARY",
-          "TTL": 60,
-          "ResourceRecords": [{"Value": "'"$AWS_APP_FQDN"'"}]
-        }
-      }
-    ]
   }'
 ```
 
-### Verify Health Check Status
+### Step 2: Configure Failover DNS Record Sets
 
-```bash
-# Check health check status
-aws route53 get-health-check-status \
-  --health-check-id "$HEALTH_CHECK_ID" \
-  --query "HealthCheckObservations[*].{Region:Region,Status:StatusReport.Status}" \
-  --output table
+In your Hosted Zone:
+1. **Primary Record**:
+   - Name: `app.yourdomain.com`
+   - Type: `CNAME`
+   - Routing Policy: **Failover**
+   - Failover Record Type: **Primary**
+   - Target: `failover-alb-97690356.ap-southeast-2.elb.amazonaws.com`
+   - Health Check: Associated with AWS Health Check ID
+   - TTL: 60s
 
-# List all resource record sets for your domain
-aws route53 list-resource-record-sets \
-  --hosted-zone-id "$HOSTED_ZONE_ID" \
-  --query "ResourceRecordSets[?Name=='${DOMAIN}.']" \
-  --output table
-```
-
-### DNS Configuration
-
-If your domain registrar is **not** Route 53, delegate the subdomain by adding NS records pointing to your Route 53 hosted zone's name servers:
-
-```bash
-# Get your hosted zone's name servers
-aws route53 get-hosted-zone \
-  --id "$HOSTED_ZONE_ID" \
-  --query "DelegationSet.NameServers" \
-  --output text
-```
-
----
-
-## Comparison
-
-| Feature | Azure Traffic Manager | AWS Route 53 |
-|---|---|---|
-| Routing method | Priority | Failover |
-| Health probe interval | 30s (10s with Standard) | 10s or 30s |
-| Failover time (approx.) | ~90s default | ~90s default |
-| TTL | 60s | 60s |
-| Cost | Per profile + per million queries | Per health check + per million queries |
-| Best when primary is | Azure App Service | Either cloud |
-
-> [!TIP]
-> Use **Azure Traffic Manager** when your primary deployment is on Azure — it integrates natively with App Service resources and supports ARM-based endpoint management.
-> Use **AWS Route 53** when your team is more AWS-centric or you need advanced routing features like geolocation or latency-based routing alongside failover.
-
-> [!IMPORTANT]
-> Ensure your `/api/health` endpoint returns HTTP **200** when healthy. Both Traffic Manager and Route 53 health checkers will mark an endpoint as unhealthy on any non-2xx response or connection timeout.
+2. **Secondary Record**:
+   - Name: `app.yourdomain.com`
+   - Type: `CNAME`
+   - Routing Policy: **Failover**
+   - Failover Record Type: **Secondary**
+   - Target: `<your-app>.azurewebsites.net`
+   - Health Check: Associated with Azure Health Check ID
+   - TTL: 60s

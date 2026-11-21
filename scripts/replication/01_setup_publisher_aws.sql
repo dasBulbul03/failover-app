@@ -1,12 +1,12 @@
 -- ============================================================================
--- SCRIPT 01: Setup PostgreSQL Logical Replication Publisher on Azure
--- Primary Cloud: Microsoft Azure (Azure Database for PostgreSQL Flexible Server)
+-- SCRIPT 01: Setup PostgreSQL Logical Replication Publisher on AWS
+-- Primary Cloud: Amazon Web Services (Amazon RDS for PostgreSQL 16)
 -- ============================================================================
 
--- Prerequisites on Azure PostgreSQL Server Parameters:
---   1. wal_level = logical
---   2. max_wal_senders = 10
---   3. max_replication_slots = 10
+-- Prerequisites on AWS RDS DB Parameter Group:
+--   1. rds.logical_replication = 1
+--   2. max_wal_senders >= 10
+--   3. max_replication_slots >= 10
 
 \c failoverdb;
 

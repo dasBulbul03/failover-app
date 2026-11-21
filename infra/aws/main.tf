@@ -21,7 +21,7 @@ provider "aws" {
       Project     = var.app_name
       Environment = var.environment
       ManagedBy   = "Terraform"
-      Role        = "DisasterRecovery-Secondary"
+      Role        = "PrimaryCloud"
     })
   }
 }

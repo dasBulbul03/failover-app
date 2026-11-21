@@ -1,11 +1,11 @@
 -- ============================================================================
--- SCRIPT 04: Promote AWS Subscriber to Standalone Read-Write Primary
--- Executed during Failover to AWS Secondary
+-- SCRIPT 04: Promote Azure Subscriber to Standalone Read-Write Primary
+-- Executed during Failover to Azure Secondary (when AWS Primary fails)
 -- ============================================================================
 
 \c failoverdb;
 
--- 1. Disable and drop the subscription to disconnect from Azure
+-- 1. Disable and drop the subscription to detach from AWS
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_subscription WHERE subname = 'failover_sub') THEN
@@ -20,8 +20,6 @@ END
 $$;
 
 -- 2. Synchronize Sequence Value
--- In logical replication, sequence values (auto-increment counters) are NOT replicated
--- automatically. We must advance the sequence to prevent duplicate key errors on INSERT!
 SELECT setval(
   pg_get_serial_sequence('messages', 'id'),
   COALESCE((SELECT MAX(id) FROM messages), 1) + 1,
@@ -30,7 +28,7 @@ SELECT setval(
 
 -- 3. Verify Database is in Read-Write Mode
 INSERT INTO messages (content, author) 
-VALUES ('System promoted to Primary on AWS Secondary Cloud', 'SRE-Failover-Automation');
+VALUES ('System promoted to Primary on Azure Secondary Cloud (Disaster Recovery Mode)', 'SRE-Failover-Automation');
 
 SELECT id, content, author, created_at 
 FROM messages 

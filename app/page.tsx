@@ -114,16 +114,16 @@ export default function Home() {
   const isAzure = env === 'azure';
   const isAws = env === 'aws';
 
-  const envBadgeClasses = isAzure
-    ? 'bg-blue-100 text-blue-800 border border-blue-300'
-    : isAws
+  const envBadgeClasses = isAws
     ? 'bg-orange-100 text-orange-800 border border-orange-300'
+    : isAzure
+    ? 'bg-blue-100 text-blue-800 border border-blue-300'
     : 'bg-gray-100 text-gray-700 border border-gray-300';
 
-  const statusLabel = isAzure
-    ? '🟢 Primary (Azure)'
-    : isAws
-    ? '🟠 Secondary (AWS)'
+  const statusLabel = isAws
+    ? '🟢 Primary (AWS)'
+    : isAzure
+    ? '🟠 Secondary (Azure DR)'
     : health
     ? `⚪ ${health.environment}`
     : '⏳ Detecting...';
@@ -303,7 +303,7 @@ export default function Home() {
                   ? 'bg-orange-50 text-orange-700 border border-orange-200'
                   : 'bg-gray-100 text-gray-700'
               }`}>
-                {isAzure ? '⚡ Normal Serving (Azure Primary)' : isAws ? '🛡️ Failover Active (AWS Disaster Recovery)' : 'Local Dev Mode'}
+                {isAws ? '⚡ Normal Serving (AWS Primary)' : isAzure ? '🛡️ Failover Active (Azure Disaster Recovery)' : 'Local Dev Mode'}
               </span>
             </div>
 
