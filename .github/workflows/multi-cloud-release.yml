@@ -13,6 +13,10 @@ on:
           - azure-only
           - aws-only
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   test:
     name: Test & Lint
@@ -54,6 +58,9 @@ jobs:
       - name: Azure Login
         uses: azure/login@v1
         with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Deploy to Azure Web App
@@ -64,16 +71,22 @@ jobs:
 
       - name: Verify Azure Health
         run: |
-          URL="https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health"
+          URL="https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health?probe=readiness"
           echo "Checking health at: $URL"
+          HEALTHY=false
           for i in {1..12}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
             if [ "$STATUS" = "200" ]; then
               echo "✅ Azure is healthy!"
+              HEALTHY=true
               break
             fi
             sleep 10
           done
+          if [ "$HEALTHY" != "true" ]; then
+            echo "❌ Azure health check failed!"
+            exit 1
+          fi
 
   deploy-aws:
     name: Deploy to AWS (Secondary)
@@ -91,6 +104,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
@@ -126,16 +140,22 @@ jobs:
           if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" = "None" ]; then
             ALB_DNS="${{ secrets.AWS_ALB_DNS || 'failover-alb-97690356.ap-southeast-2.elb.amazonaws.com' }}"
           fi
-          URL="http://$ALB_DNS/api/health"
+          URL="http://$ALB_DNS/api/health?probe=readiness"
           echo "Checking health at: $URL"
+          HEALTHY=false
           for i in {1..12}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
             if [ "$STATUS" = "200" ]; then
               echo "✅ AWS is healthy!"
+              HEALTHY=true
               break
             fi
             sleep 10
           done
+          if [ "$HEALTHY" != "true" ]; then
+            echo "❌ AWS health check failed!"
+            exit 1
+          fi
 
   release-summary:
     name: Multi-Cloud Release Summary

@@ -1,0 +1,17 @@
+# Example Terraform Variables for AWS Secondary Deployment
+aws_region          = "ap-southeast-2"
+environment         = "prod"
+app_name            = "failover-app"
+vpc_cidr            = "10.0.0.0/16"
+db_password         = "REPLACE_WITH_SECURE_PASSWORD_MIN_16_CHARS"
+container_image_uri = "" # Leave blank to default to ECR :latest
+desired_count       = 1  # FinOps: 1 for warm standby, 0 for cold pilot-light
+enable_nat_gateway  = false # FinOps: false saves ~$32/month
+monthly_budget_limit_usd = 50
+alert_email_addresses    = ["devops-alerts@yourdomain.com"]
+
+tags = {
+  Project     = "failover-app"
+  Owner       = "SRE-Team"
+  CostCenter  = "DisasterRecovery"
+}

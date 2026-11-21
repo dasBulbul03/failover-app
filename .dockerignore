@@ -1,6 +1,33 @@
+# Dependencies
 node_modules
+.pnp
+.pnp.js
+
+# Build and output artifacts
 .next
+out
+build
+dist
+*.tsbuildinfo
+
+# Version control and documentation
 .git
+.github
 *.md
+docs
+infra
+scripts
+
+# Environment and secrets
 .env*
 !.env.local.example
+*.pem
+*.key
+
+# Logs and system files
+*.log
+npm-debug.log*
+yarn-debug.log*
+.DS_Store
+.terraform
+*.tfstate*

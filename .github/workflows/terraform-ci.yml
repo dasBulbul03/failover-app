@@ -1,0 +1,55 @@
+name: Terraform Validation & Security Lint
+
+on:
+  push:
+    paths:
+      - 'infra/**'
+  pull_request:
+    paths:
+      - 'infra/**'
+  workflow_dispatch:
+
+jobs:
+  validate-aws-terraform:
+    name: Validate AWS Terraform Modules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.7.0'
+
+      - name: Check Terraform Formatting
+        run: |
+          cd infra/aws
+          terraform fmt -check -recursive
+
+      - name: Validate AWS Root Module
+        run: |
+          cd infra/aws
+          terraform init -backend=false
+          terraform validate
+
+  validate-azure-terraform:
+    name: Validate Azure Terraform Module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.7.0'
+
+      - name: Check Terraform Formatting
+        run: |
+          cd infra/azure
+          terraform fmt -check
+
+      - name: Validate Azure Module
+        run: |
+          cd infra/azure
+          terraform init -backend=false
+          terraform validate

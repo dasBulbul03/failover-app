@@ -1,0 +1,74 @@
+name: Multi-Cloud Failover & Failback Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Orchestration Action'
+        required: true
+        type: choice
+        default: 'status-check'
+        options:
+          - status-check
+          - auto-monitor
+          - failover-to-aws
+          - failback-to-azure
+      reason:
+        description: 'Reason for action / drill notes'
+        required: false
+        default: 'Manual SRE operation'
+
+jobs:
+  orchestrate:
+    name: Execute Disaster Recovery Orchestration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure CLI Login (if configured)
+        if: "${{ secrets.AZURE_CREDENTIALS != '' }}"
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Run Failover Orchestrator
+        env:
+          AZURE_HEALTH_URL: "https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health?probe=readiness"
+          AWS_HEALTH_URL: "http://${{ secrets.AWS_ALB_DNS || 'failover-alb-97690356.ap-southeast-2.elb.amazonaws.com' }}/api/health?probe=readiness"
+          AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP || 'failover-rg' }}
+          TM_PROFILE_NAME: ${{ secrets.TM_PROFILE_NAME || 'failover-tm' }}
+          ACTION: ${{ github.event.inputs.action }}
+        run: |
+          case "$ACTION" in
+            status-check)
+              ./scripts/failover/orchestrator.sh status
+              ;;
+            auto-monitor)
+              ./scripts/failover/orchestrator.sh monitor
+              ;;
+            failover-to-aws)
+              ./scripts/failover/orchestrator.sh failover
+              ;;
+            failback-to-azure)
+              ./scripts/failover/orchestrator.sh failback
+              ;;
+            *)
+              ./scripts/failover/orchestrator.sh status
+              ;;
+          esac
+
+      - name: Post Audit Log to GitHub Summary
+        if: always()
+        run: |
+          echo "## 🛡️ SRE Failover Orchestration Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: \`${{ github.event.inputs.action }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: ${{ github.event.inputs.reason }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered By**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ -f "failover_audit.log" ]]; then
+            echo "### Audit Log Trace" >> $GITHUB_STEP_SUMMARY
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            cat failover_audit.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

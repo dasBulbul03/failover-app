@@ -1,34 +1,44 @@
 output "alb_dns_name" {
-  description = "Application Load Balancer DNS name"
-  value       = aws_lb.main.dns_name
+  description = "Application Load Balancer DNS Name"
+  value       = module.alb.alb_dns_name
 }
 
 output "app_url" {
-  description = "Direct HTTP URL to the application"
-  value       = "http://${aws_lb.main.dns_name}"
+  description = "Direct HTTP access URL to the AWS secondary application"
+  value       = "http://${module.alb.alb_dns_name}"
 }
 
 output "health_endpoint" {
-  description = "Health check URL for DNS failover monitoring"
-  value       = "http://${aws_lb.main.dns_name}/api/health"
+  description = "Health check probe endpoint for global DNS failover"
+  value       = "http://${module.alb.alb_dns_name}/api/health?probe=readiness"
 }
 
 output "ecr_repository_url" {
-  description = "ECR repository URL for pushing Docker images"
-  value       = aws_ecr_repository.app.repository_url
+  description = "ECR Repository URL for container image pushes"
+  value       = module.ecr.repository_url
 }
 
 output "rds_endpoint" {
-  description = "PostgreSQL endpoint"
-  value       = aws_db_instance.postgres.endpoint
+  description = "PostgreSQL RDS connection endpoint"
+  value       = module.rds.rds_endpoint
 }
 
 output "ecs_cluster_name" {
-  description = "ECS cluster name"
-  value       = aws_ecs_cluster.main.name
+  description = "ECS Cluster Name"
+  value       = module.ecs.cluster_name
 }
 
 output "ecs_service_name" {
-  description = "ECS service name"
-  value       = aws_ecs_service.app.name
+  description = "ECS Service Name"
+  value       = module.ecs.service_name
+}
+
+output "cloudwatch_dashboard_name" {
+  description = "SRE CloudWatch Dashboard Name"
+  value       = module.monitoring.dashboard_name
+}
+
+output "cost_budget_name" {
+  description = "AWS FinOps Budget Name"
+  value       = module.finops.budget_name
 }
