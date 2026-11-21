@@ -4,7 +4,7 @@
 [![Terraform CI](https://github.com/dasBulbul03/failover-app/actions/workflows/terraform-ci.yml/badge.svg)](https://github.com/dasBulbul03/failover-app/actions/workflows/terraform-ci.yml)
 [![Deploy to AWS](https://github.com/dasBulbul03/failover-app/actions/workflows/aws-deploy.yml/badge.svg)](https://github.com/dasBulbul03/failover-app/actions/workflows/aws-deploy.yml)
 
-An enterprise-style active-passive multi-cloud disaster recovery platform operating across **Amazon Web Services (Primary)** and **Microsoft Azure (Secondary / Disaster Recovery)**. Powered by a containerized **Next.js 14 App Router** service and **PostgreSQL** with cross-cloud logical replication, automated health monitoring, orchestrated DNS failover, zero-data-loss failback procedures, modular Terraform IaC, and cloud FinOps cost governance.
+An enterprise-style active-passive multi-cloud disaster recovery platform operating across **Amazon Web Services (Primary)** and **Microsoft Azure (Secondary / Disaster Recovery)**. Powered by a containerized **Next.js 14 App Router** service and **PostgreSQL** with cross-cloud logical replication, automated health monitoring, orchestrated DNS failover, data-consistent failback procedures, modular Terraform IaC, and cloud FinOps cost governance.
 
 ---
 
@@ -38,16 +38,16 @@ An enterprise-style active-passive multi-cloud disaster recovery platform operat
 ## Section 1: Project Overview
 
 ### 1.1 Introduction
-**FailoverApp** is an enterprise multi-cloud resilience platform designed to guarantee high availability (99.99%) for mission-critical web applications. It demonstrates how to decouple an organization from single-cloud vendor risk by hosting active workloads in **Amazon Web Services (AWS Primary)** with automated, data-consistent disaster recovery to **Microsoft Azure (Secondary / Disaster Recovery)**.
+**FailoverApp** is an enterprise multi-cloud resilience platform designed to eliminate single-cloud vendor risk by hosting primary workloads in **Amazon Web Services (AWS Primary)** with structured, data-consistent disaster recovery to **Microsoft Azure (Secondary / Disaster Recovery)**.
 
 ### 1.2 Problem Statement
 Public cloud providers experience regional outages, fiber cuts, control-plane collapses, and storage degradations. Relying on a single cloud vendor leaves critical businesses vulnerable to global tenant failures, provider-wide billing lockouts, and routing partitions. Furthermore, traditional multi-cloud setups frequently suffer from the **database split-brain problem**, where failover instances operate on stale or desynchronized data.
 
 ### 1.3 Key Objectives
-- **Sub-Minute Recovery Time Objective (RTO)**: Automated failover detection and DNS repointing within 60–90 seconds.
-- **Controlled Recovery Point Objective (RPO)**: Continuous asynchronous cross-cloud PostgreSQL logical replication achieving sub-5-second RPO.
-- **Zero Split-Brain Failback**: Safe reverse resynchronization before restoring primary traffic to AWS.
-- **Production-Minded IaC**: Clean, modular, reusable Terraform modules with S3/DynamoDB state locking.
+- **Target Recovery Time Objective (RTO)**: Target 60–90 seconds (design target based on 3x health probe intervals + 60s DNS TTL; depends on client resolver cache compliance).
+- **Target Recovery Point Objective (RPO)**: Target < 5 seconds under nominal cross-cloud latency via PostgreSQL logical replication (asynchronous replication does not guarantee zero data loss during sudden hardware or power termination).
+- **Split-Brain Prevention & Safe Failback**: Fencing old primary to read-only before failover; reverse resynchronization of failover deltas before restoring primary traffic to AWS.
+- **Production-Minded IaC**: Clean, modular, reusable Terraform modules with S3/DynamoDB state locking and `.tfvars` security exclusions.
 - **FinOps Cost Governance**: Warm standby / pilot-light compute architectures with AWS Budgets and cost allocation tags.
 
 ### 1.4 Core Features
@@ -298,9 +298,9 @@ All replication automation resides in [`scripts/replication/`](scripts/replicati
 - **`04_promote_subscriber_azure.sql` / `promote_subscriber_azure.sh`**: Detaches subscription and advances ID sequence on Azure for read-write operations.
 - **`05_failback_resync_aws.sql` / `resync_failback_aws.sh`**: Reverses replication stream to sync Azure failover writes back to AWS Primary.
 
-### 8.3 RPO & RTO SLA Definitions
-- **Recovery Point Objective (RPO)**: **500ms – 2.5s** (under nominal cross-cloud network latency). Transactions committed on AWS within the exact ~1-second window of a sudden regional datacenter power collapse before WAL shipping may be lost.
-- **Recovery Time Objective (RTO)**: **60s – 90s** (Health degradation detection 45s + DNS TTL 60s).
+### 8.3 RPO & RTO SLA Definitions & Real-World Constraints
+- **Target Recovery Point Objective (RPO)**: **Target: < 5s (untested in live cross-cloud production)**. Under nominal conditions, asynchronous logical replication ships WAL records within 500ms–2.5s. However, because replication is asynchronous, any transaction committed on AWS after the last received LSN prior to an ungraceful crash will not exist on Azure. **Zero data loss cannot be claimed with asynchronous replication.**
+- **Target Recovery Time Objective (RTO)**: **Target: 60s – 90s (design target)**. Derived from 3 failed probes (15s) + DNS TTL cache expiry (60s). Real-world RTO is subject to client-side DNS caching behavior, ISP resolver minimum TTL overrides, and application database connection pool drain time.
 
 ---
 
@@ -553,13 +553,35 @@ bash scripts/dr/run-dr-scenario.sh <scenario-id>
 
 ---
 
-## Section 20: Project Limitations & Future Roadmap
+## Section 20: Verified Implementation Status & Known Limitations
 
-### Current Status
-- **Implemented & Cloud-Verified**: Next.js 14 App, dual health checks, Docker containerization, AWS modular Terraform, live AWS ECS Fargate + RDS deployment (`ap-southeast-2`), GitHub Actions CI/CD, replication and failover orchestration scripts.
-- **Implemented (Ready for Azure Subscription)**: Azure Terraform module (`infra/azure/main.tf`), Azure Bicep template.
+### 20.1 Implementation & Verification Matrix
 
-### Future Roadmap
+| Component | Architecture Role | Implementation Status | Live Cloud Verification | Validation Method |
+| :--- | :--- | :--- | :--- | :--- |
+| **AWS Primary Compute** | ECS Fargate (`failover-cluster`) | Complete (`infra/aws/modules/ecs`) | ✅ **Live in `ap-southeast-2`** | HTTP 200 via ALB endpoint |
+| **AWS Primary Database** | Amazon RDS PostgreSQL 16 | Complete (`infra/aws/modules/rds`) | ✅ **Live in `ap-southeast-2`** | 1ms query latency via health probe |
+| **AWS Load Balancer** | Application Load Balancer | Complete (`infra/aws/modules/alb`) | ✅ **Live (`failover-alb-97690356...`)** | Traffic routing & health check verified |
+| **AWS Container Registry** | Amazon ECR (Immutable tags) | Complete (`infra/aws/modules/ecr`) | ✅ **Live repository `failover-app`** | Image push & pull verified |
+| **AWS CloudWatch Alarms** | Observability & SNS Alerts | Complete (`infra/aws/modules/monitoring`) | Complete in Terraform | Syntactically verified & formatted |
+| **Application Layer** | Next.js 14 App Router | Complete (`app/`, `lib/`) | ✅ **Verified** | `npm test` (0 lint/type errors), `npm run build` |
+| **Azure Secondary Compute** | Linux App Service (B1) | Complete (`infra/azure/main.tf`) | ⏳ *Designed & Validated via IaC* | Terraform code complete; requires active Azure sub |
+| **Azure Secondary Database** | PostgreSQL Flexible Server | Complete (`infra/azure/main.tf`) | ⏳ *Designed & Validated via IaC* | Terraform code complete; requires active Azure sub |
+| **PostgreSQL Replication** | AWS RDS → Azure Logical Replication | Complete (`scripts/replication/`) | ⏳ *Designed & Script-Validated* | SQL syntax and logic verified; awaits Azure host |
+| **Failover Orchestrator** | Concurrency-safe Bash state machine | Complete (`scripts/failover/`) | ⏳ *Script-Validated (CLI dry-run)* | Tested locally; awaits live Azure endpoint |
+| **DNS Failover** | Traffic Manager / Route 53 | Complete (`infra/dns/`) | ⏳ *Designed* | Requires registered domain name |
+
+### 20.2 Known Limitations & Constraints
+1. **Asynchronous Logical Replication Constraints**:
+   - DDL (schema migrations like `ALTER TABLE`) is **not** replicated automatically by PostgreSQL logical replication. Schema migrations must be applied to both clouds.
+   - Sequence values (`SERIAL` / `BIGSERIAL`) are **not** replicated in real time. The promotion script (`04_promote_subscriber_azure.sql`) executes `setval()` to resync sequence heads upon promotion.
+   - Asynchronous WAL shipping means that during a hard crash of AWS, transactions committed in the preceding replication lag window (< 5s) may be lost. Zero data loss is not guaranteed.
+2. **DNS Propagation Caching**:
+   - DNS failover is subject to intermediate DNS resolver TTL compliance. Some public resolvers or clients ignore low TTLs (e.g. 60s), meaning real-world client traffic shift can take longer than the theoretical RTO.
+3. **AWS Free Tier Operational Profile**:
+   - In dev mode, ECS tasks run in public subnets with security group restrictions to avoid the ~$32/month NAT Gateway charge. For enterprise production, `enable_nat_gateway = true` must be enabled to place ECS tasks in private application subnets.
+
+### 20.3 Future Roadmap
 - [ ] Implement cross-cloud IPSec VPN or WireGuard tunnel for private PostgreSQL replication traffic.
 - [ ] Evaluate distributed consensus databases (e.g. CockroachDB) for active-active zero-RPO multi-cloud writes.
 - [ ] Introduce OpenTelemetry distributed tracing across both clouds.

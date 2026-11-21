@@ -13,8 +13,9 @@ PG_PASSWORD="${PG_PASSWORD:-$(openssl rand -base64 16)}"
 DEPLOY_ENGINE="${DEPLOY_ENGINE:-terraform}" # Options: terraform, bicep
 
 echo "==================================================================="
-echo "  AZURE PRIMARY INFRASTRUCTURE DEPLOYMENT"
+echo "  AZURE SECONDARY (DISASTER RECOVERY) INFRASTRUCTURE DEPLOYMENT"
 echo "  Engine: $DEPLOY_ENGINE | Location: $LOCATION | RG: $RESOURCE_GROUP"
+echo "  Role: Standby Disaster Recovery Cloud (AWS is Primary)"
 echo "  Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 echo "==================================================================="
 

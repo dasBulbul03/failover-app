@@ -1,0 +1,25 @@
+# ==============================================================================
+# PROD ENVIRONMENT — Terraform Variable Values Example
+# Copy to terraform.tfvars and fill in real values.
+# NEVER commit terraform.tfvars — it is .gitignored.
+# Store secrets in AWS Secrets Manager; reference via data sources in Terraform.
+# ==============================================================================
+
+aws_region  = "ap-southeast-2"
+app_name    = "failover-app"
+
+# REQUIRED: Use a strong random password stored in AWS Secrets Manager.
+# Generate with: aws secretsmanager get-random-password --password-length 32
+db_password = "REPLACE_WITH_PRODUCTION_SECRET_FROM_SECRETS_MANAGER"
+
+# Production overrides
+environment        = "prod"
+enable_nat_gateway = true   # Required for private subnet ECS (cost: ~$32/mo)
+container_cpu      = 512
+container_memory   = 1024
+min_capacity       = 2
+max_capacity       = 10
+alarm_email        = "oncall@example.com"
+
+# Optional: Pre-built ECR image URI (skips build step)
+# container_image_uri = "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/failover-app:sha-abc1234"

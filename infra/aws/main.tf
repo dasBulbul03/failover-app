@@ -97,7 +97,20 @@ module "rds" {
   tags              = local.common_tags
 }
 
-# 6. Observability (CloudWatch Log Group, Alarms, SRE Dashboard)
+# 6a. SNS Alarm Topic (CloudWatch alarms → email/PagerDuty)
+resource "aws_sns_topic" "alarms" {
+  name = "${var.app_name}-${var.environment}-alarms"
+  tags = local.common_tags
+}
+
+resource "aws_sns_topic_subscription" "alarm_email" {
+  count     = var.alarm_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.alarms.arn
+  protocol  = "email"
+  endpoint  = var.alarm_email
+}
+
+# 6b. Observability (CloudWatch Log Group, Alarms, SRE Dashboard)
 module "monitoring" {
   source = "./modules/monitoring"
 
@@ -109,6 +122,7 @@ module "monitoring" {
   target_group_arn_suffix = replace(module.alb.target_group_arn, "/.*targetgroup\\//", "")
   rds_identifier          = "${var.app_name}-${var.environment}-pg"
   log_retention_days      = var.log_retention_days
+  alarm_sns_topic_arn     = aws_sns_topic.alarms.arn
   tags                    = local.common_tags
 }
 

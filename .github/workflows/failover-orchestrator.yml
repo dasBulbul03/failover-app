@@ -34,9 +34,13 @@ jobs:
       - name: Run Failover Orchestrator
         env:
           AWS_HEALTH_URL: "http://${{ secrets.AWS_ALB_DNS || 'failover-alb-97690356.ap-southeast-2.elb.amazonaws.com' }}/api/health?probe=readiness"
-          AZURE_HEALTH_URL: "https://${{ secrets.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/health?probe=readiness"
+          AZURE_HEALTH_URL: "https://${{ secrets.AZURE_WEBAPP_NAME || 'failover-app' }}.azurewebsites.net/api/health?probe=readiness"
           AZURE_RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP || 'failover-rg' }}
           TM_PROFILE_NAME: ${{ secrets.TM_PROFILE_NAME || 'failover-tm' }}
+          AWS_RDS_ENDPOINT: ${{ secrets.AWS_RDS_ENDPOINT }}
+          AWS_RDS_PASSWORD: ${{ secrets.AWS_RDS_PASSWORD }}
+          AZURE_PG_HOST: ${{ secrets.AZURE_PG_HOST }}
+          AZURE_PG_PASSWORD: ${{ secrets.AZURE_PG_PASSWORD }}
           ACTION: ${{ github.event.inputs.action }}
         run: |
           case "$ACTION" in

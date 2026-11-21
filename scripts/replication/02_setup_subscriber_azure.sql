@@ -1,6 +1,7 @@
 -- ============================================================================
 -- SCRIPT 02: Setup PostgreSQL Logical Replication Subscriber on Azure
 -- Secondary Cloud: Microsoft Azure (Azure Database for PostgreSQL Flexible Server)
+-- Publisher: Amazon Web Services (Amazon RDS for PostgreSQL 16)
 -- ============================================================================
 
 -- Prerequisites on Azure PostgreSQL Server Parameters:
@@ -12,12 +13,17 @@
 
 BEGIN;
 
--- 1. Ensure Table Schema Exists Prior to Subscription Setup
+-- 1. Ensure Table Schemas Exist Prior to Subscription Setup
 CREATE TABLE IF NOT EXISTS messages (
   id SERIAL PRIMARY KEY,
   content TEXT NOT NULL,
   author VARCHAR(100) NOT NULL DEFAULT 'Anonymous',
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS replication_heartbeat (
+  id INT PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- 2. Drop existing subscription if refreshing
@@ -36,7 +42,7 @@ CREATE SUBSCRIPTION failover_sub
     enabled = true
   );
 
--- Verification
+-- Verification Queries
 SELECT subid, subname, subenabled, subconninfo, subpublications
 FROM pg_subscription
 WHERE subname = 'failover_sub';

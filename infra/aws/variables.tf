@@ -100,6 +100,12 @@ variable "alert_email_addresses" {
   default     = []
 }
 
+variable "alarm_email" {
+  description = "Email address for CloudWatch alarm notifications via SNS. Leave empty to disable email subscription."
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   description = "Resource tags"
   type        = map(string)

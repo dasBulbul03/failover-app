@@ -26,6 +26,21 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Terraform: Never commit actual variable files with secrets
+# Keep only *.tfvars.example files
+*.tfvars
+!*.tfvars.example
+
+# Terraform state files (always use remote state)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Failover state/lock files
+/tmp/failover_orchestrator.lock
+failover_state.json
+
 # local env files
 .env.local
 .env.development.local

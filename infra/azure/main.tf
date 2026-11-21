@@ -1,8 +1,7 @@
 # ==============================================================================
-# Azure Primary Infrastructure — Multi-Cloud Failover Platform
-# AUTHORITATIVE IAC FOR AZURE
-# Provisions: App Service, PostgreSQL Flexible Server (Logical Replication),
-#             Key Vault, Managed Identity, Log Analytics
+# Azure Secondary Infrastructure (Disaster Recovery Target) — FailoverApp
+# Provisions: App Service (B1), PostgreSQL Flexible Server (Logical Replication Subscriber),
+#             Key Vault, User-Assigned Managed Identity, Log Analytics
 # ==============================================================================
 
 terraform {
@@ -129,6 +128,12 @@ resource "azurerm_key_vault_secret" "pg_password" {
   key_vault_id = azurerm_key_vault.kv.id
 }
 
+resource "azurerm_key_vault_secret" "database_url" {
+  name         = "database-url"
+  value        = "postgresql://pgadmin:${var.pg_password}@${azurerm_postgresql_flexible_server.pg.fqdn}:5432/failoverdb?sslmode=require"
+  key_vault_id = azurerm_key_vault.kv.id
+}
+
 # 5. Linux App Service Plan
 resource "azurerm_service_plan" "plan" {
   name                = "${var.app_name}-plan"
@@ -187,6 +192,8 @@ resource "azurerm_linux_web_app" "app" {
     identity_ids = [azurerm_user_assigned_identity.app_identity.id]
   }
 
+  key_vault_reference_identity_id = azurerm_user_assigned_identity.app_identity.id
+
   site_config {
     always_on         = true
     health_check_path = "/api/health?probe=readiness"
@@ -196,7 +203,7 @@ resource "azurerm_linux_web_app" "app" {
   }
 
   app_settings = {
-    DATABASE_URL = "postgresql://pgadmin:${var.pg_password}@${azurerm_postgresql_flexible_server.pg.fqdn}:5432/failoverdb?sslmode=require"
+    DATABASE_URL = "@Microsoft.KeyVault(SecretUri=${azurerm_key_vault_secret.database_url.versionless_id})"
     APP_ENV      = "azure"
     REGION       = var.location
     NODE_ENV     = "production"

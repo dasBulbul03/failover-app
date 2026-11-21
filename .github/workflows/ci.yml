@@ -2,7 +2,7 @@ name: Application CI & Quality Gate
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/**']
   pull_request:
     branches: [main]
 
@@ -25,20 +25,77 @@ jobs:
       - name: Run Test Suite (ESLint + TypeScript Compiler)
         run: npm test
 
-  docker-build-verify:
-    name: Container Build & Security Scan
+  docker-build-and-scan:
+    name: Container Build & Trivy Security Scan
     runs-on: ubuntu-latest
     needs: test-and-lint
+    permissions:
+      security-events: write  # Required for SARIF upload to GitHub Security tab
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker Image (Dry Run)
+      - name: Build Docker Image
         run: |
           docker build --platform linux/amd64 -t failover-app:ci-test .
 
       - name: Inspect Image
-        run: |
-          docker images failover-app:ci-test
+        run: docker images failover-app:ci-test
+
+      # -----------------------------------------------------------------------
+      # Trivy container vulnerability scan
+      # Fails the pipeline on CRITICAL or HIGH findings.
+      # Results are uploaded to GitHub Security → Code Scanning tab (SARIF).
+      # -----------------------------------------------------------------------
+      - name: Run Trivy container scan (SARIF output for GitHub Security)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: 'failover-app:ci-test'
+          format: 'sarif'
+          output: 'trivy-container-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'  # Don't fail here; fail on the table scan below
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-container-results.sarif'
+          category: 'trivy-container'
+
+      - name: Run Trivy container scan (table output — fail on CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: 'failover-app:ci-test'
+          format: 'table'
+          severity: 'CRITICAL'
+          exit-code: '1'
+
+  filesystem-scan:
+    name: Trivy Filesystem Scan (Source & Dependencies)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy filesystem SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+          category: 'trivy-filesystem'

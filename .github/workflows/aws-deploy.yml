@@ -52,24 +52,53 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build, tag, and push image to ECR
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_TAG: sha-${{ github.sha }}
         run: |
           docker build --platform linux/amd64 \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          # Try pushing :latest tag (succeeds if MUTABLE, harmlessly caught if IMMUTABLE)
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest || echo "ℹ️ Note: ECR repository tag mutability is IMMUTABLE; latest tag overwrite skipped."
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Deploy to ECS Fargate
+      - name: Deploy to ECS Fargate (Immutable Image Revision)
+        env:
+          IMAGE_URI: ${{ steps.build-image.outputs.image_uri }}
         run: |
-          echo "🔄 Forcing new deployment on ECS cluster $ECS_CLUSTER / service $ECS_SERVICE..."
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --force-new-deployment \
-            --region $AWS_REGION
+          echo "🔄 Deploying immutable image: $IMAGE_URI to cluster $ECS_CLUSTER / service $ECS_SERVICE..."
+          
+          SERVICE_STATUS=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION" --query "services[0].status" --output text 2>/dev/null || echo "MISSING")
+          
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            CURRENT_TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION" --query "services[0].taskDefinition" --output text)
+            echo "Current Task Def ARN: $CURRENT_TASK_DEF_ARN"
+
+            aws ecs describe-task-definition --task-definition "$CURRENT_TASK_DEF_ARN" --region "$AWS_REGION" --query "taskDefinition" > task-def.json
+            
+            # Substitute image and strip read-only metadata fields required for register-task-definition
+            jq --arg IMAGE "$IMAGE_URI" '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' task-def.json > new-task-def.json
+            
+            NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --region "$AWS_REGION" --query "taskDefinition.taskDefinitionArn" --output text)
+            echo "✅ Registered new task definition: $NEW_TASK_DEF_ARN"
+
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$ECS_SERVICE" \
+              --task-definition "$NEW_TASK_DEF_ARN" \
+              --region "$AWS_REGION"
+            echo "✅ ECS service update initiated."
+          else
+            echo "⚠️ ECS service not found in region $AWS_REGION. Forcing service deployment if service exists under alternate name..."
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$ECS_SERVICE" \
+              --force-new-deployment \
+              --region "$AWS_REGION" 2>/dev/null || echo "ECS service deployment skipped."
+          fi
 
       - name: Resolve ALB Endpoint
         id: alb

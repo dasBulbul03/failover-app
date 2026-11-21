@@ -1,6 +1,7 @@
 -- ============================================================================
 -- SCRIPT 01: Setup PostgreSQL Logical Replication Publisher on AWS
 -- Primary Cloud: Amazon Web Services (Amazon RDS for PostgreSQL 16)
+-- Target Subscriber: Microsoft Azure (Azure Database for PostgreSQL Flexible Server)
 -- ============================================================================
 
 -- Prerequisites on AWS RDS DB Parameter Group:
@@ -21,19 +22,28 @@ BEGIN
 END
 $$;
 
--- 2. Grant permissions to the replication user
+-- 2. Create replication heartbeat table for true logical replication freshness monitoring
+CREATE TABLE IF NOT EXISTS replication_heartbeat (
+  id INT PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO replication_heartbeat (id, ts) VALUES (1, NOW())
+ON CONFLICT (id) DO UPDATE SET ts = NOW();
+
+-- 3. Grant permissions to the replication user
 GRANT CONNECT ON DATABASE failoverdb TO repl_user;
 GRANT USAGE ON SCHEMA public TO repl_user;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO repl_user;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO repl_user;
 
--- 3. Configure Replica Identity for data change capture
--- DEFAULT uses the primary key (id) for identifying rows in UPDATE/DELETE
+-- 4. Configure Replica Identity for data change capture
+-- DEFAULT uses the primary key for identifying rows in UPDATE/DELETE
 ALTER TABLE messages REPLICA IDENTITY DEFAULT;
+ALTER TABLE replication_heartbeat REPLICA IDENTITY DEFAULT;
 
--- 4. Create Publication for the application tables
+-- 5. Create Publication for the application tables and heartbeat
 DROP PUBLICATION IF EXISTS failover_pub;
-CREATE PUBLICATION failover_pub FOR TABLE messages;
+CREATE PUBLICATION failover_pub FOR TABLE messages, replication_heartbeat;
 
 COMMIT;
 

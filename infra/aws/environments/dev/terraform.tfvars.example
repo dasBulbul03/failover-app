@@ -1,0 +1,22 @@
+# ==============================================================================
+# DEV ENVIRONMENT — Terraform Variable Values Example
+# Copy to terraform.tfvars and fill in real values.
+# NEVER commit terraform.tfvars — it is .gitignored.
+# Store secrets in AWS Secrets Manager or SSM Parameter Store.
+# ==============================================================================
+
+aws_region  = "ap-southeast-2"
+app_name    = "failover-app"
+
+# REQUIRED: Set a strong password (min 16 chars, mixed case + numbers + symbols)
+# Generate with: openssl rand -base64 24
+db_password = "REPLACE_WITH_SECURE_PASSWORD"
+
+# Optional overrides (defaults come from variables.tf)
+# environment         = "dev"
+# enable_nat_gateway  = false   # false saves ~$32/mo; ECS tasks use public IP
+# container_cpu       = 256
+# container_memory    = 512
+# min_capacity        = 1
+# max_capacity        = 2
+# alarm_email         = "alerts@example.com"
