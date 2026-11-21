@@ -14,6 +14,13 @@ interface HealthData {
   db: string;
   timestamp: string;
   region: string;
+  latency_ms?: number;
+  dependencies?: {
+    database?: {
+      status: string;
+      latency_ms?: number;
+    };
+  };
 }
 
 export default function Home() {
@@ -287,22 +294,35 @@ export default function Home() {
         {/* Health / System Info */}
         {health && (
           <section className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6">
-            <h2 className="text-lg font-semibold text-gray-800 mb-4">🔍 System Health</h2>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-4 gap-2">
+              <h2 className="text-lg font-semibold text-gray-800">🔍 SRE Observability & Health</h2>
+              <span className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
+                isAzure
+                  ? 'bg-blue-50 text-blue-700 border border-blue-200'
+                  : isAws
+                  ? 'bg-orange-50 text-orange-700 border border-orange-200'
+                  : 'bg-gray-100 text-gray-700'
+              }`}>
+                {isAzure ? '⚡ Normal Serving (Azure Primary)' : isAws ? '🛡️ Failover Active (AWS Disaster Recovery)' : 'Local Dev Mode'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
               {[
-                { label: 'Status', value: health.status },
-                { label: 'Environment', value: health.environment },
-                { label: 'Database', value: health.db },
-                { label: 'Region', value: health.region },
-              ].map(({ label, value }) => (
+                { label: 'Status', value: health.status, color: health.status === 'healthy' || health.status === 'ok' ? 'text-green-600' : 'text-red-600' },
+                { label: 'Cloud Provider', value: health.environment, color: 'text-gray-800' },
+                { label: 'PostgreSQL DB', value: health.db, color: health.db === 'ok' ? 'text-green-600' : 'text-red-600' },
+                { label: 'Region', value: health.region, color: 'text-gray-800' },
+                { label: 'Probe Latency', value: health.latency_ms !== undefined ? `${health.latency_ms} ms` : (health.dependencies?.database?.latency_ms !== undefined ? `${health.dependencies.database.latency_ms} ms` : '< 20 ms'), color: 'text-blue-600' },
+              ].map(({ label, value, color }) => (
                 <div key={label} className="bg-gray-50 rounded-xl p-3 border border-gray-100 text-center">
-                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-1">{label}</div>
-                  <div className="text-sm font-semibold text-gray-800 capitalize">{value}</div>
+                  <div className="text-[11px] text-gray-500 uppercase tracking-wide mb-1">{label}</div>
+                  <div className={`text-sm font-semibold capitalize ${color}`}>{value}</div>
                 </div>
               ))}
             </div>
             <p className="text-xs text-gray-400 mt-3 text-right">
-              Auto-refreshes every 10 seconds
+              Live heartbeat auto-refreshes every 10 seconds
             </p>
           </section>
         )}

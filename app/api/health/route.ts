@@ -57,6 +57,7 @@ export async function GET(request: NextRequest) {
     probe: 'readiness',
     environment: process.env.APP_ENV || 'azure',
     region: process.env.REGION || 'unknown',
+    db: dbStatus,
     dependencies: {
       database: {
         status: dbStatus,
